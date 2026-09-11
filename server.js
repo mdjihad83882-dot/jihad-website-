@@ -1,0 +1,2840 @@
+const express = require('express');
+const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
+const { Pool } = require('pg');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const path = require('path');
+const fs = require('fs');
+const QRCode = require('qrcode');
+const multer = require('multer');
+const crypto = require('crypto');
+
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SESSION_SECRET = process.env.SESSION_SECRET || 'change-this-session-secret';
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '');
+const FREE_LINK_LIMIT = 3;
+const PLAN_1_PRICE = Math.max(1, Number(process.env.PLAN_1_PRICE || 100));
+const PLAN_3_PRICE = Math.max(1, Number(process.env.PLAN_3_PRICE || 250));
+const PLAN_1_USD = Number(process.env.PLAN_1_USD || 0.81);
+const PLAN_3_USD = Number(process.env.PLAN_3_USD || 2.02);
+const PLAN_12_PRICE = Math.max(1, Number(process.env.PLAN_12_PRICE || 550));
+const PLAN_12_USD = Number(process.env.PLAN_12_USD || 4.45);
+const BKASH_NUMBER = String(process.env.BKASH_NUMBER || '').trim();
+const NAGAD_NUMBER = String(process.env.NAGAD_NUMBER || '').trim();
+const BINANCE_ID = String(process.env.BINANCE_ID || '').trim();
+const API_RATE_LIMIT = Math.max(10, Number(process.env.API_RATE_LIMIT || 120));
+const AUTO_BACKUP_HOURS = Math.max(1, Number(process.env.AUTO_BACKUP_HOURS || 24));
+const BLOCKED_DOMAINS = String(process.env.BLOCKED_DOMAINS || '')
+  .split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
+
+const IPINFO_TOKEN = String(process.env.IPINFO_TOKEN || '').trim();
+const GEO_LOOKUP_TIMEOUT_MS = Math.max(300, Number(process.env.GEO_LOOKUP_TIMEOUT_MS || 1200));
+const GEO_CACHE_TTL_MS = Math.max(60000, Number(process.env.GEO_CACHE_TTL_MS || 21600000)); // 6 hours
+const geoCache = new Map();
+
+
+const paymentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!/^image\/(png|jpe?g|webp)$/i.test(file.mimetype || '')) {
+      return cb(new Error('Payment screenshot must be PNG, JPG or WEBP'));
+    }
+    cb(null, true);
+  }
+});
+
+app.set('trust proxy', 1);
+
+// ===== DOMAIN CONFIG =====
+const BASE_URL = (process.env.BASE_URL || 'https://thispersonisbrandshortner.com').replace(/\/$/, '');
+const BASE_HOST = new URL(BASE_URL).hostname.toLowerCase();
+const X_CLIENT_ID=String(process.env.X_CLIENT_ID||'').trim();
+const X_CLIENT_SECRET=String(process.env.X_CLIENT_SECRET||'').trim();
+const X_REDIRECT_URI=String(process.env.X_REDIRECT_URI||`${BASE_URL}/x/oauth/callback`).trim();
+const X_AUTHORIZE_URL='https://x.com/i/oauth2/authorize';
+const X_TOKEN_URL='https://api.x.com/2/oauth2/token';
+const X_API_BASE='https://api.x.com/2';
+const X_SCOPES='tweet.read tweet.write users.read offline.access';
+const CUSTOM_DOMAINS = [
+  process.env.DOMAIN_1, process.env.DOMAIN_2, process.env.DOMAIN_3,
+  process.env.DOMAIN_4, process.env.DOMAIN_5, process.env.DOMAIN_6,
+  process.env.DOMAIN_7, process.env.DOMAIN_8, process.env.DOMAIN_9, process.env.DOMAIN_10
+].filter(Boolean)
+  .map(d => String(d).trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '').toLowerCase())
+  .filter((d, i, arr) => d && d !== BASE_HOST && arr.indexOf(d) === i);
+const AVAILABLE_DOMAINS = [BASE_HOST, ...CUSTOM_DOMAINS];
+
+// Free plan is intentionally locked to one domain only.
+// Premium users can use every enabled domain.
+const FREE_PLAN_DOMAINS = new Set([
+  'thispersonisbrandshortner.world'
+]);
+
+const PREVIEW_DESCRIPTION = process.env.PREVIEW_DESCRIPTION || 'Fast, clean and secure short links powered by THIS PERSON IS BRAND.';
+
+// ===== VIEW ENGINE / STATIC =====
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(async (req,res,next)=>{
+  res.locals.announcement=await getActiveAnnouncement();
+  next();
+});
+
+// ===== MIDDLEWARE =====
+app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+app.use(compression());
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/', limiter);
+const apiV1Limiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: API_RATE_LIMIT,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use('/api/v1/', apiV1Limiter);
+
+// ===== POSTGRESQL: APP DATA + SESSIONS =====
+const dbUrl = (process.env.DATABASE_URL || '').trim();
+if (!dbUrl) {
+  console.error('❌ DATABASE_URL is required for V6 Full PostgreSQL.');
+  console.error('Set DATABASE_URL in the Railway website service, then redeploy.');
+  process.exit(1);
+}
+const isRailwayInternal = /\.railway\.internal(?::\d+)?\//i.test(dbUrl);
+const pool = new Pool({
+  connectionString: dbUrl,
+  ssl: isRailwayInternal ? false : { rejectUnauthorized: false },
+  max: 12,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
+
+pool.on('error', err => console.error('PostgreSQL pool error:', err.message));
+
+// ===== V7.47 REDIRECT RELIABILITY / CACHE =====
+const REDIRECT_CACHE_TTL_MS = Math.max(3000, Number(process.env.REDIRECT_CACHE_TTL_MS || 15000));
+const REDIRECT_CACHE_MAX = Math.max(100, Number(process.env.REDIRECT_CACHE_MAX || 5000));
+const redirectCache = new Map();
+const recentRealClickSignatures = new Map();
+const redirectPerf = {
+  startedAt: Date.now(),
+  requests: 0,
+  cacheHits: 0,
+  cacheMisses: 0,
+  dbRetries: 0,
+  dbFailures: 0,
+  lookupTotalMs: 0,
+  lookupSamples: 0,
+  duplicateFiltered: 0
+};
+
+function redirectCacheKey(domain, code){
+  return `${normalizeHost(domain)}::${String(code||'')}`;
+}
+function getCachedRedirect(domain,code){
+  const key=redirectCacheKey(domain,code);
+  const item=redirectCache.get(key);
+  if(!item) return null;
+  if(item.expiresAt<=Date.now()){
+    redirectCache.delete(key);
+    return null;
+  }
+  // Simple LRU touch.
+  redirectCache.delete(key);
+  redirectCache.set(key,item);
+  return item.row;
+}
+function setCachedRedirect(domain,code,row){
+  const key=redirectCacheKey(domain,code);
+  redirectCache.delete(key);
+  redirectCache.set(key,{row,expiresAt:Date.now()+REDIRECT_CACHE_TTL_MS});
+  while(redirectCache.size>REDIRECT_CACHE_MAX){
+    const first=redirectCache.keys().next().value;
+    if(first===undefined) break;
+    redirectCache.delete(first);
+  }
+}
+function invalidateRedirectCache(domain,code){
+  redirectCache.delete(redirectCacheKey(domain,code));
+}
+function isTransientDbError(err){
+  const message=String(err?.message||err||'').toLowerCase();
+  const code=String(err?.code||'').toUpperCase();
+  return ['ECONNRESET','ECONNREFUSED','ETIMEDOUT','57P01','57P02','57P03','08000','08003','08006'].includes(code) ||
+    /connection terminated|connection reset|socket hang up|server closed the connection|terminating connection|timeout/.test(message);
+}
+async function redirectQueryWithRetry(text,params,retries=2){
+  let lastErr;
+  for(let attempt=0;attempt<=retries;attempt++){
+    try{
+      return await pool.query(text,params);
+    }catch(err){
+      lastErr=err;
+      if(!isTransientDbError(err) || attempt>=retries){
+        redirectPerf.dbFailures++;
+        throw err;
+      }
+      redirectPerf.dbRetries++;
+      await new Promise(r=>setTimeout(r,80*(attempt+1)));
+    }
+  }
+  throw lastErr;
+}
+async function findRedirectRow(domain,code){
+  redirectPerf.requests++;
+  const t0=Date.now();
+  const cached=getCachedRedirect(domain,code);
+  if(cached){
+    redirectPerf.cacheHits++;
+    redirectPerf.lookupTotalMs += (Date.now()-t0);
+    redirectPerf.lookupSamples++;
+    return cached;
+  }
+  redirectPerf.cacheMisses++;
+  const q=await redirectQueryWithRetry(
+    'SELECT * FROM links WHERE selected_domain=$1 AND short_code=$2 AND is_active=TRUE LIMIT 1',
+    [normalizeHost(domain),String(code||'')]
+  );
+  redirectPerf.lookupTotalMs += (Date.now()-t0);
+  redirectPerf.lookupSamples++;
+  if(!q.rowCount) return null;
+  setCachedRedirect(domain,code,q.rows[0]);
+  return q.rows[0];
+}
+function isDuplicateRealClick(linkId,ip,ua){
+  const now=Date.now();
+  const signature=`${linkId}|${String(ip||'')}|${String(ua||'').slice(0,220)}`;
+  const previous=recentRealClickSignatures.get(signature)||0;
+  recentRealClickSignatures.set(signature,now);
+  // Keep map bounded and prune old entries opportunistically.
+  if(recentRealClickSignatures.size>15000){
+    const cutoff=now-60000;
+    for(const [k,v] of recentRealClickSignatures){
+      if(v<cutoff) recentRealClickSignatures.delete(k);
+      if(recentRealClickSignatures.size<=10000) break;
+    }
+  }
+  const duplicate=previous && (now-previous)<8000;
+  if(duplicate) redirectPerf.duplicateFiltered++;
+  return !!duplicate;
+}
+function getRedirectPerfStats(){
+  const total=redirectPerf.cacheHits+redirectPerf.cacheMisses;
+  return {
+    cacheSize:redirectCache.size,
+    cacheHitRate:total?Math.round((redirectPerf.cacheHits/total)*1000)/10:0,
+    cacheHits:redirectPerf.cacheHits,
+    cacheMisses:redirectPerf.cacheMisses,
+    dbRetries:redirectPerf.dbRetries,
+    dbFailures:redirectPerf.dbFailures,
+    duplicateFiltered:redirectPerf.duplicateFiltered,
+    avgLookupMs:redirectPerf.lookupSamples?Math.round((redirectPerf.lookupTotalMs/redirectPerf.lookupSamples)*10)/10:0,
+    uptimeMinutes:Math.floor((Date.now()-redirectPerf.startedAt)/60000)
+  };
+}
+
+
+const sessionStore = new pgSession({
+  pool,
+  tableName: 'user_sessions',
+  createTableIfMissing: true,
+  pruneSessionInterval: 60 * 15,
+  errorLog: err => console.error('PostgreSQL session store error:', err)
+});
+
+app.use(session({
+  store: sessionStore,
+  proxy: true,
+  name: 'tpib.sid',
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  rolling: true,
+  cookie: {
+    maxAge: 1000 * 60 * 60 * 24 * 30,
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    sameSite: 'lax'
+  }
+}));
+
+app.use(async(req,res,next)=>{
+  try{
+    const p=String(req.path||'/');
+    if(p==='/health' || p==='/favicon.ico' || p.startsWith('/admin')) return next();
+    // V7.41: the admin website account (ADMIN_EMAIL / is_admin) can use the full site during maintenance.
+    // This lets the admin verify updates before reopening the website for everyone else.
+    if(await getAdminState(req)) return next();
+    if(!(await isSiteMaintenanceOn())) return next();
+    res.set('Cache-Control','no-store, no-cache, must-revalidate');
+    if(p.startsWith('/api/')) return res.status(503).json({error:'Website under maintenance',maintenance:true});
+    const maintenanceDetails=await getMaintenancePublicDetails();
+    return res.status(503).send(maintenanceHtml(maintenanceDetails));
+  }catch(e){
+    console.error('Maintenance middleware error:',e.message);
+    next();
+  }
+});
+
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      telegram_id TEXT UNIQUE NOT NULL,
+      username TEXT NOT NULL DEFAULT '',
+      first_name TEXT NOT NULL DEFAULT '',
+      last_name TEXT NOT NULL DEFAULT '',
+      display_name TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '',
+      profile_photo TEXT NOT NULL DEFAULT '',
+      timezone TEXT NOT NULL DEFAULT 'Asia/Dhaka',
+      account_status TEXT NOT NULL DEFAULT 'active',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_login TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      total_links INTEGER NOT NULL DEFAULT 0,
+      total_clicks BIGINT NOT NULL DEFAULT 0,
+      is_admin BOOLEAN NOT NULL DEFAULT FALSE
+    );
+
+    CREATE TABLE IF NOT EXISTS links (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      selected_domain TEXT NOT NULL,
+      original_url TEXT NOT NULL,
+      short_code TEXT NOT NULL,
+      custom_slug TEXT,
+      title TEXT NOT NULL DEFAULT '',
+      clicks BIGINT NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      is_expired BOOLEAN NOT NULL DEFAULT FALSE,
+      expires_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(selected_domain, short_code)
+    );
+
+    CREATE TABLE IF NOT EXISTS clicks (
+      id BIGSERIAL PRIMARY KEY,
+      link_id BIGINT NOT NULL REFERENCES links(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ip_address TEXT NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL DEFAULT '',
+      device TEXT NOT NULL DEFAULT 'Unknown',
+      browser TEXT NOT NULL DEFAULT 'Unknown',
+      os TEXT NOT NULL DEFAULT 'Unknown',
+      country TEXT NOT NULL DEFAULT 'Unknown',
+      country_code TEXT NOT NULL DEFAULT 'XX',
+      city TEXT NOT NULL DEFAULT '',
+      region TEXT NOT NULL DEFAULT '',
+      referrer TEXT NOT NULL DEFAULT '',
+      is_bot BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS online_users (
+      user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      username TEXT NOT NULL DEFAULT '',
+      display_name TEXT NOT NULL DEFAULT '',
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS site_visitors (
+      visitor_id TEXT PRIMARY KEY,
+      user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      ip_address TEXT NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL DEFAULT '',
+      first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      page_views BIGINT NOT NULL DEFAULT 1,
+      last_path TEXT NOT NULL DEFAULT '/',
+      country TEXT NOT NULL DEFAULT 'Unknown',
+      country_code TEXT NOT NULL DEFAULT 'XX'
+    );
+    CREATE INDEX IF NOT EXISTS idx_site_visitors_last_seen ON site_visitors(last_seen);
+
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_type TEXT NOT NULL DEFAULT 'free';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_reason TEXT NOT NULL DEFAULT '';
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS lifetime_links_created INTEGER NOT NULL DEFAULT 0;
+    UPDATE users
+    SET lifetime_links_created = GREATEST(lifetime_links_created, total_links);
+
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      plan_months INTEGER NOT NULL CHECK (plan_months IN (1,3)),
+      amount INTEGER NOT NULL,
+      method TEXT NOT NULL,
+      transaction_id TEXT NOT NULL UNIQUE,
+      screenshot BYTEA,
+      screenshot_mime TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      admin_note TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reviewed_at TIMESTAMPTZ
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
+    CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS api_key_hash TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS api_key_prefix TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS api_key_created_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS api_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS api_admin_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS password_hash TEXT;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS password_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS link_type TEXT NOT NULL DEFAULT 'standard';
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS auto_update_url TEXT;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS auto_update_threshold INTEGER;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS auto_update_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS auto_update_start_clicks BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE links ADD COLUMN IF NOT EXISTS auto_update_switched_at TIMESTAMPTZ;
+
+    CREATE TABLE IF NOT EXISTS redeem_codes (
+      id BIGSERIAL PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      premium_days INTEGER NOT NULL CHECK (premium_days > 0),
+      max_uses INTEGER NOT NULL CHECK (max_uses > 0),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS redeem_code_uses (
+      id BIGSERIAL PRIMARY KEY,
+      redeem_code_id BIGINT NOT NULL REFERENCES redeem_codes(id) ON DELETE CASCADE,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(redeem_code_id,user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_redeem_code_uses_code ON redeem_code_uses(redeem_code_id);
+    CREATE INDEX IF NOT EXISTS idx_redeem_code_uses_user ON redeem_code_uses(user_id);
+
+    CREATE TABLE IF NOT EXISTS site_settings (
+      setting_key TEXT PRIMARY KEY,
+      setting_value TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_by TEXT NOT NULL DEFAULT ''
+    );
+    INSERT INTO site_settings(setting_key,setting_value)
+    VALUES('maintenance_mode','off')
+    ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('maintenance_message','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('maintenance_eta','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('maintenance_until','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_access_token','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_refresh_token','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_token_expires_at','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_username','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_user_id','') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('x_tool_maintenance','off') ON CONFLICT(setting_key) DO NOTHING;
+    INSERT INTO site_settings(setting_key,setting_value) VALUES('canva_tool_maintenance','off') ON CONFLICT(setting_key) DO NOTHING;
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      type TEXT NOT NULL DEFAULT 'info',
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id BIGSERIAL PRIMARY KEY,
+      admin_email TEXT NOT NULL DEFAULT '',
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL DEFAULT '',
+      target_id TEXT NOT NULL DEFAULT '',
+      details TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS domain_settings (
+      domain TEXT PRIMARY KEY,
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      maintenance BOOLEAN NOT NULL DEFAULT FALSE,
+      last_health TEXT NOT NULL DEFAULT 'unknown',
+      last_checked_at TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS app_backups (
+      id BIGSERIAL PRIMARY KEY,
+      backup_data JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_by TEXT NOT NULL DEFAULT 'automatic'
+    );
+
+    CREATE TABLE IF NOT EXISTS announcements (
+      id BIGSERIAL PRIMARY KEY,
+      message TEXT NOT NULL,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, is_read);
+    CREATE INDEX IF NOT EXISTS idx_audit_created ON admin_audit_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_backups_created ON app_backups(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_announcements_active ON announcements(is_active, updated_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_links_user_id ON links(user_id);
+    CREATE INDEX IF NOT EXISTS idx_links_domain_code ON links(selected_domain, short_code);
+    CREATE INDEX IF NOT EXISTS idx_clicks_user_id ON clicks(user_id);
+    CREATE INDEX IF NOT EXISTS idx_clicks_link_id ON clicks(link_id);
+    CREATE INDEX IF NOT EXISTS idx_clicks_created_at ON clicks(created_at);
+    CREATE INDEX IF NOT EXISTS idx_online_last_seen ON online_users(last_seen);
+  `);
+  for (const domain of AVAILABLE_DOMAINS) {
+    await pool.query(`INSERT INTO domain_settings(domain,enabled,maintenance)
+      VALUES($1,TRUE,FALSE) ON CONFLICT(domain) DO NOTHING`, [normalizeHost(domain)]);
+  }
+  console.log('✅ Full app database tables ready: users, links, clicks, online_users, payments, api, notifications, audit, domains, backups, redeem, settings');
+  console.log(`🌍 Geo detection: Cloudflare headers + real forwarded IP + geoip-lite${IPINFO_TOKEN ? ' + IPinfo' : ''}`);
+}
+
+
+let maintenanceCache={value:false,at:0};
+async function isSiteMaintenanceOn(force=false){
+  const now=Date.now();
+  if(!force && now-maintenanceCache.at<1500) return maintenanceCache.value;
+
+  try{
+    const q=await pool.query(
+      "SELECT setting_key,setting_value FROM site_settings WHERE setting_key IN ('maintenance_mode','maintenance_until')"
+    );
+
+    const state={maintenance_mode:'off',maintenance_until:''};
+    q.rows.forEach(r=>{ state[r.setting_key]=String(r.setting_value||''); });
+
+    let enabled=String(state.maintenance_mode||'').toLowerCase()==='on';
+    const untilRaw=String(state.maintenance_until||'').trim();
+
+    if(enabled && untilRaw){
+      const untilMs=Date.parse(untilRaw);
+      if(Number.isFinite(untilMs) && untilMs<=now){
+        await pool.query(`
+          INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by)
+          VALUES('maintenance_mode','off',NOW(),'auto-resume')
+          ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value='off',updated_at=NOW(),updated_by='auto-resume'
+        `);
+        await pool.query(`
+          INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by)
+          VALUES('maintenance_until','',NOW(),'auto-resume')
+          ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value='',updated_at=NOW(),updated_by='auto-resume'
+        `);
+        enabled=false;
+      }
+    }
+
+    maintenanceCache={value:enabled,at:now};
+    return enabled;
+  }catch(e){
+    console.error('Maintenance state read error:',e.message);
+    return false;
+  }
+}
+async function getMaintenancePublicDetails(){
+  try{
+    const q=await pool.query("SELECT setting_key,setting_value FROM site_settings WHERE setting_key IN ('maintenance_message','maintenance_eta','maintenance_until')");
+    const data={message:'',eta:'',until:''};
+    q.rows.forEach(r=>{
+      if(r.setting_key==='maintenance_message') data.message=String(r.setting_value||'').trim();
+      if(r.setting_key==='maintenance_eta') data.eta=String(r.setting_value||'').trim();
+      if(r.setting_key==='maintenance_until') data.until=String(r.setting_value||'').trim();
+    });
+    return data;
+  }catch(e){
+    console.error('Maintenance details read error:',e.message);
+    return {message:'',eta:'',until:''};
+  }
+}
+function maintenanceHtml(meta={}){
+  const esc=(s)=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+  const message=esc(meta.message||'');
+  const eta=esc(meta.eta||'');
+  const untilRaw=String(meta.until||'').trim();
+  const untilSafe=esc(untilRaw);
+
+  const optionalMessage=message?`<div class="note"><strong>Update</strong><span>${message}</span></div>`:'';
+  const optionalEta=eta?`<div class="eta"><span>⏱ Expected restore</span><strong>${eta}</strong></div>`:'';
+  const countdownBox=untilRaw?`
+    <div class="countdown-wrap">
+      <span class="countdown-label">AUTO RESUME IN</span>
+      <div id="maintenanceCountdown" class="countdown" data-until="${untilSafe}">Calculating...</div>
+      <small id="maintenanceResumeAt"></small>
+    </div>`:'';
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>Website Under Maintenance</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;font-family:Inter,Arial,sans-serif;color:#eef4ff;background:radial-gradient(circle at 20% 20%,rgba(108,99,255,.22),transparent 32%),radial-gradient(circle at 80% 80%,rgba(39,215,255,.12),transparent 34%),#070d1f}
+.card{width:min(680px,100%);padding:34px 26px;border-radius:26px;text-align:center;background:rgba(18,28,58,.92);border:1px solid rgba(140,160,255,.22);box-shadow:0 30px 90px rgba(0,0,0,.48)}
+.icon{font-size:52px}
+.brand{margin:12px 0 4px;font-weight:900;letter-spacing:.02em;color:#9fe9ff}
+.card h1{font-size:clamp(28px,6vw,46px);margin:10px 0}
+.card p{color:#aebbd5;line-height:1.7;margin:10px auto;max-width:540px}
+.pill{display:inline-flex;gap:8px;align-items:center;margin-top:16px;padding:9px 14px;border-radius:999px;color:#ffe59a;background:rgba(255,205,80,.08);border:1px solid rgba(255,205,80,.18);font-weight:800;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;background:#ffd45c;box-shadow:0 0 14px #ffd45c;animation:p 1.3s infinite}
+@keyframes p{50%{opacity:.35}}
+.eta,.note{margin:16px auto 0;max-width:520px;padding:13px 15px;border-radius:14px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
+.eta span,.note strong{color:#9fe9ff}.eta strong{color:#fff}.note span{color:#d8e2f7}
+.countdown-wrap{margin:18px auto 0;max-width:520px;padding:17px;border-radius:18px;background:linear-gradient(135deg,rgba(108,99,255,.13),rgba(39,215,255,.07));border:1px solid rgba(120,150,255,.18)}
+.countdown-label{display:block;font-size:11px;font-weight:900;letter-spacing:.18em;color:#9fe9ff}
+.countdown{margin:7px 0 4px;font-size:clamp(28px,8vw,48px);font-weight:950;letter-spacing:.02em;color:#fff;font-variant-numeric:tabular-nums;text-shadow:0 0 24px rgba(87,204,255,.2)}
+.countdown-wrap small{margin:0;color:#8ea0c2}
+.contact{margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,.08);color:#93a3c2}
+.contact a{display:inline-flex;align-items:center;gap:7px;margin-top:8px;padding:9px 14px;border-radius:999px;text-decoration:none;color:#fff;background:#168bd2;font-weight:800}
+small{display:block;margin-top:18px;color:#7181a3}
+</style>
+</head>
+<body>
+<main class="card">
+<div class="icon">🛠️</div>
+<div class="brand">THIS PERSON IS BRAND SHORTLINK</div>
+<h1>Website Under Maintenance</h1>
+<p>We are currently performing maintenance and improvements. The website, API and all short links are temporarily paused. Nothing has been deleted.</p>
+${optionalMessage}
+${optionalEta}
+${countdownBox}
+<div class="pill"><span class="dot"></span> Maintenance in progress</div>
+<div class="contact">Need an update?<br><a href="https://t.me/thispersonisbrand537" target="_blank" rel="noopener noreferrer">✈ Message Admin @thispersonisbrand537</a></div>
+<small>This page checks again automatically every 15 seconds.</small>
+</main>
+<script>
+(function(){
+  var el=document.getElementById('maintenanceCountdown');
+  if(!el)return;
+
+  var raw=el.getAttribute('data-until')||'';
+  var target=Date.parse(raw);
+  var resumeAt=document.getElementById('maintenanceResumeAt');
+
+  function pad(n){return String(n).padStart(2,'0');}
+  function tick(){
+    if(!Number.isFinite(target)){
+      el.textContent='Scheduled';
+      return;
+    }
+
+    if(resumeAt){
+      try{resumeAt.textContent='Scheduled: '+new Date(target).toLocaleString();}catch(_){}
+    }
+
+    var left=target-Date.now();
+    if(left<=0){
+      el.textContent='00:00:00';
+      setTimeout(function(){window.location.reload();},700);
+      return;
+    }
+
+    var total=Math.floor(left/1000);
+    var days=Math.floor(total/86400);
+    var hours=Math.floor((total%86400)/3600);
+    var mins=Math.floor((total%3600)/60);
+    var secs=total%60;
+
+    el.textContent=(days>0?days+'d ':'')+pad(hours)+':'+pad(mins)+':'+pad(secs);
+  }
+
+  tick();
+  setInterval(tick,1000);
+})();
+</script>
+</body>
+</html>`;
+}
+
+function toIso(v) { return v ? new Date(v).toISOString() : null; }
+function mapUser(r) {
+  if (!r) return null;
+  return {
+    id: Number(r.id), telegramId: r.telegram_id, username: r.username,
+    firstName: r.first_name, lastName: r.last_name, displayName: r.display_name,
+    email: r.email, profilePhoto: r.profile_photo, timezone: r.timezone,
+    accountStatus: r.account_status, createdAt: toIso(r.created_at), lastLogin: toIso(r.last_login),
+    totalLinks: Number(r.total_links || 0), lifetimeLinksCreated: Number(r.lifetime_links_created || 0), totalClicks: Number(r.total_clicks || 0), isAdmin: !!r.is_admin,
+    planType: r.plan_type || 'free', premiumUntil: toIso(r.premium_until), blockedReason: r.blocked_reason || '',
+    isPremium: (r.plan_type === 'premium' && r.premium_until && new Date(r.premium_until) > new Date()),
+    apiEnabled: !!r.api_enabled, apiAdminEnabled: r.api_admin_enabled !== false, apiKeyPrefix: r.api_key_prefix || '', apiKeyCreatedAt: toIso(r.api_key_created_at)
+  };
+}
+function mapLink(r) {
+  if (!r) return null;
+  return {
+    id: Number(r.id), userId: Number(r.user_id), selectedDomain: r.selected_domain,
+    originalUrl: r.original_url, shortCode: r.short_code, customSlug: r.custom_slug,
+    title: r.title || '', clicks: Number(r.clicks || 0), isActive: !!r.is_active,
+    isExpired: !!r.is_expired, expiresAt: toIso(r.expires_at), createdAt: toIso(r.created_at), updatedAt: toIso(r.updated_at),
+    passwordEnabled: !!r.password_enabled, linkType: r.link_type || 'standard',
+    autoUpdateUrl: r.auto_update_url || '', autoUpdateThreshold: Number(r.auto_update_threshold || 0),
+    autoUpdateEnabled: !!r.auto_update_enabled, autoUpdateStartClicks: Number(r.auto_update_start_clicks || 0),
+    autoUpdateSwitchedAt: toIso(r.auto_update_switched_at)
+  };
+}
+function mapClick(r) {
+  return {
+    id: Number(r.id), linkId: Number(r.link_id), userId: Number(r.user_id), ipAddress: r.ip_address,
+    userAgent: r.user_agent, device: r.device, browser: r.browser, os: r.os,
+    country: r.country, countryCode: r.country_code, city: r.city, region: r.region,
+    referrer: r.referrer, isBot: !!r.is_bot, createdAt: toIso(r.created_at)
+  };
+}
+function mapOnline(r) {
+  return { id: Number(r.user_id), username: r.username, displayName: r.display_name, lastSeen: new Date(r.last_seen).getTime() };
+}
+
+async function migrateLegacyJsonIfPossible() {
+  const legacyPath = path.join(__dirname, 'data.json');
+  if (!fs.existsSync(legacyPath)) return;
+  try {
+    const count = await pool.query('SELECT COUNT(*)::int AS count FROM users');
+    if (Number(count.rows[0].count) > 0) return;
+    const legacy = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+    if (!legacy || !Array.isArray(legacy.users) || legacy.users.length === 0) return;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const u of legacy.users) {
+        await client.query(`INSERT INTO users
+          (id, telegram_id, username, first_name, last_name, display_name, email, profile_photo, timezone, account_status, created_at, last_login, total_links, total_clicks, is_admin)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (telegram_id) DO NOTHING`,
+          [u.id, String(u.telegramId || u.id), u.username||'', u.firstName||'', u.lastName||'', u.displayName||'', u.email||'', u.profilePhoto||'', u.timezone||'Asia/Dhaka', u.accountStatus||'active', u.createdAt||new Date(), u.lastLogin||new Date(), u.totalLinks||0, u.totalClicks||0, !!u.isAdmin]);
+      }
+      for (const l of (legacy.links || [])) {
+        await client.query(`INSERT INTO links
+          (id,user_id,selected_domain,original_url,short_code,custom_slug,title,clicks,is_active,is_expired,expires_at,created_at,updated_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`,
+          [l.id,l.userId,normalizeHost(l.selectedDomain||BASE_HOST),l.originalUrl,l.shortCode,l.customSlug||null,l.title||'',l.clicks||0,l.isActive!==false,!!l.isExpired,l.expiresAt||null,l.createdAt||new Date(),l.updatedAt||new Date()]);
+      }
+      for (const c of (legacy.clicks || [])) {
+        await client.query(`INSERT INTO clicks
+          (id,link_id,user_id,ip_address,user_agent,device,browser,os,country,country_code,city,region,referrer,is_bot,created_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT DO NOTHING`,
+          [c.id,c.linkId,c.userId,c.ipAddress||'',c.userAgent||'',c.device||'Unknown',c.browser||'Unknown',c.os||'Unknown',c.country||'Unknown',c.countryCode||'XX',c.city||'',c.region||'',c.referrer||'',!!c.isBot,c.createdAt||new Date()]);
+      }
+      await client.query("SELECT setval(pg_get_serial_sequence('users','id'), COALESCE((SELECT MAX(id) FROM users),1), true)");
+      await client.query("SELECT setval(pg_get_serial_sequence('links','id'), COALESCE((SELECT MAX(id) FROM links),1), true)");
+      await client.query("SELECT setval(pg_get_serial_sequence('clicks','id'), COALESCE((SELECT MAX(id) FROM clicks),1), true)");
+      await client.query('COMMIT');
+      console.log(`✅ Legacy data.json migrated to PostgreSQL (${legacy.users.length} users)`);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('Legacy migration skipped/failed:', e.message);
+    } finally { client.release(); }
+  } catch (e) { console.error('Legacy migration check failed:', e.message); }
+}
+
+// ===== COUNTRY DATA =====
+// Keep the familiar country names/flags from the previous version, but also
+// support any ISO-3166 alpha-2 code returned by geoip-lite.
+const knownCountries = {
+  BD:{name:'Bangladesh',flag:'🇧🇩'},IN:{name:'India',flag:'🇮🇳'},US:{name:'United States',flag:'🇺🇸'},GB:{name:'United Kingdom',flag:'🇬🇧'},DE:{name:'Germany',flag:'🇩🇪'},FR:{name:'France',flag:'🇫🇷'},JP:{name:'Japan',flag:'🇯🇵'},CN:{name:'China',flag:'🇨🇳'},AU:{name:'Australia',flag:'🇦🇺'},CA:{name:'Canada',flag:'🇨🇦'},BR:{name:'Brazil',flag:'🇧🇷'},NG:{name:'Nigeria',flag:'🇳🇬'},PK:{name:'Pakistan',flag:'🇵🇰'},SA:{name:'Saudi Arabia',flag:'🇸🇦'},AE:{name:'UAE',flag:'🇦🇪'},SG:{name:'Singapore',flag:'🇸🇬'},RU:{name:'Russia',flag:'🇷🇺'},TR:{name:'Turkey',flag:'🇹🇷'},MX:{name:'Mexico',flag:'🇲🇽'},AR:{name:'Argentina',flag:'🇦🇷'},EG:{name:'Egypt',flag:'🇪🇬'},ID:{name:'Indonesia',flag:'🇮🇩'},KR:{name:'South Korea',flag:'🇰🇷'},IT:{name:'Italy',flag:'🇮🇹'},ES:{name:'Spain',flag:'🇪🇸'},ZA:{name:'South Africa',flag:'🇿🇦'},MY:{name:'Malaysia',flag:'🇲🇾'},PH:{name:'Philippines',flag:'🇵🇭'},VN:{name:'Vietnam',flag:'🇻🇳'},TH:{name:'Thailand',flag:'🇹🇭'},NL:{name:'Netherlands',flag:'🇳🇱'},SE:{name:'Sweden',flag:'🇸🇪'},NO:{name:'Norway',flag:'🇳🇴'},DK:{name:'Denmark',flag:'🇩🇰'},FI:{name:'Finland',flag:'🇫🇮'},PL:{name:'Poland',flag:'🇵🇱'},UA:{name:'Ukraine',flag:'🇺🇦'},RO:{name:'Romania',flag:'🇷🇴'},GR:{name:'Greece',flag:'🇬🇷'},PT:{name:'Portugal',flag:'🇵🇹'},BE:{name:'Belgium',flag:'🇧🇪'},CH:{name:'Switzerland',flag:'🇨🇭'},AT:{name:'Austria',flag:'🇦🇹'},HU:{name:'Hungary',flag:'🇭🇺'},CZ:{name:'Czech Republic',flag:'🇨🇿'},IE:{name:'Ireland',flag:'🇮🇪'},NZ:{name:'New Zealand',flag:'🇳🇿'},CL:{name:'Chile',flag:'🇨🇱'},CO:{name:'Colombia',flag:'🇨🇴'},PE:{name:'Peru',flag:'🇵🇪'},VE:{name:'Venezuela',flag:'🇻🇪'}
+};
+
+function countryFlag(code) {
+  const c = String(code || '').toUpperCase();
+  if (!/^[A-Z]{2}$/.test(c)) return '🌐';
+  return String.fromCodePoint(...[...c].map(ch => 127397 + ch.charCodeAt(0)));
+}
+
+let regionNames = null;
+try { regionNames = new Intl.DisplayNames(['en'], { type: 'region' }); } catch (_) {}
+
+function countryInfo(code) {
+  const c = String(code || 'XX').toUpperCase();
+  if (knownCountries[c]) return knownCountries[c];
+  let name = c === 'XX' ? 'Unknown' : c;
+  try { if (regionNames && c !== 'XX') name = regionNames.of(c) || c; } catch (_) {}
+  return { name, flag: c === 'XX' ? '🌐' : countryFlag(c) };
+}
+
+const countries = new Proxy(knownCountries, {
+  get(target, prop) {
+    if (typeof prop !== 'string') return target[prop];
+    return target[prop] || countryInfo(prop);
+  }
+});
+
+function generateShortCode() {
+  const chars='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code=''; for(let i=0;i<6;i++) code += chars.charAt(Math.floor(Math.random()*chars.length));
+  return code;
+}
+function isBot(ua){
+  return /bot|crawler|spider|scraper|facebookexternalhit|facebot|twitterbot|linkedinbot|pinterest|slackbot|discordbot|whatsapp|telegrambot|instagram|headlesschrome|phantomjs|selenium|playwright|puppeteer|curl\/|wget\/|python-requests|python\/|aiohttp|httpclient|okhttp|go-http-client|java\//i.test(ua||'');
+}
+function isSocialPreviewBot(ua){ return /facebookexternalhit|facebot|twitterbot|linkedinbot|whatsapp|telegrambot|discordbot|slackbot|pinterest|skypeuripreview/i.test(ua||''); }
+function getDeviceInfo(ua='') {
+  let device='Desktop',browser='Unknown',os='Unknown';
+  if (/Tablet|iPad/i.test(ua)) device='Tablet'; else if (/Mobile|Android|iPhone/i.test(ua)) device='Mobile';
+  if (ua.includes('Chrome')&&!ua.includes('Edg')) browser='Chrome'; else if(ua.includes('Firefox')) browser='Firefox'; else if(ua.includes('Safari')&&!ua.includes('Chrome')) browser='Safari'; else if(ua.includes('Edg')) browser='Edge'; else if(ua.includes('Opera')) browser='Opera';
+  if(ua.includes('Windows')) os='Windows'; else if(ua.includes('Mac OS')) os='macOS'; else if(ua.includes('Android')) os='Android'; else if(/iPhone|iPad/.test(ua)) os='iOS'; else if(ua.includes('Linux')) os='Linux';
+  return {device,browser,os};
+}
+function normalizeClientIp(ip) {
+  let value = String(ip || '').trim();
+  if (!value) return '';
+  if (value.startsWith('::ffff:')) value = value.slice(7);
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']');
+    if (end > 0) value = value.slice(1, end);
+  }
+  // Strip :port only for normal IPv4:port values.
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(value)) value = value.replace(/:\d+$/, '');
+  return value.trim();
+}
+
+function isPrivateOrReservedIp(ip) {
+  const v = normalizeClientIp(ip).toLowerCase();
+  if (!v) return true;
+
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(v)) {
+    const p = v.split('.').map(Number);
+    if (p.some(n => n < 0 || n > 255 || Number.isNaN(n))) return true;
+    if (p[0] === 10 || p[0] === 127 || p[0] === 0) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+    if (p[0] === 192 && p[1] === 168) return true;
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+    if (p[0] === 100 && p[1] >= 64 && p[1] <= 127) return true; // CGNAT
+    if (p[0] >= 224) return true;
+    return false;
+  }
+
+  // IPv6 local/reserved.
+  if (v === '::1' || v === '::' || v.startsWith('fe80:') || v.startsWith('fc') || v.startsWith('fd')) return true;
+  return false;
+}
+
+function forwardedIpCandidates(req) {
+  const values = [];
+  const push = raw => {
+    String(raw || '').split(',').forEach(part => {
+      const ip = normalizeClientIp(part);
+      if (ip && !values.includes(ip)) values.push(ip);
+    });
+  };
+
+  // Cloudflare gives the original visitor IP here when orange-cloud proxying is enabled.
+  push(req.get('cf-connecting-ip'));
+  push(req.get('true-client-ip'));
+  // Railway / reverse proxy forwarding chain.
+  push(req.get('x-forwarded-for'));
+  push(req.get('x-real-ip'));
+  push(req.ip);
+  push(req.socket?.remoteAddress);
+  push(req.connection?.remoteAddress);
+
+  return values;
+}
+
+function getRealClientIp(req) {
+  const candidates = forwardedIpCandidates(req);
+  return candidates.find(ip => !isPrivateOrReservedIp(ip)) || candidates[0] || '';
+}
+
+function validCountryCode(code) {
+  const c = String(code || '').trim().toUpperCase();
+  // Cloudflare can send XX (unknown) or T1 (Tor); don't treat those as a real country.
+  return /^[A-Z]{2}$/.test(c) && c !== 'XX';
+}
+
+function getCloudflareCountry(req) {
+  const code = String(req.get('cf-ipcountry') || '').trim().toUpperCase();
+  return validCountryCode(code) ? code : '';
+}
+
+function localGeoLookup(ip) {
+  try {
+    if (!ip || isPrivateOrReservedIp(ip)) return null;
+    const geo = require('geoip-lite').lookup(ip);
+    if (!geo) return null;
+    const code = validCountryCode(geo.country) ? String(geo.country).toUpperCase() : 'XX';
+    return {
+      countryCode: code,
+      country: countryInfo(code).name,
+      city: String(geo.city || ''),
+      region: String(geo.region || ''),
+      source: 'geoip-lite'
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+async function ipinfoLookup(ip) {
+  if (!IPINFO_TOKEN || !ip || isPrivateOrReservedIp(ip)) return null;
+
+  const cached = geoCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GEO_LOOKUP_TIMEOUT_MS);
+
+  try {
+    const r = await fetch(`https://ipinfo.io/${encodeURIComponent(ip)}/json?token=${encodeURIComponent(IPINFO_TOKEN)}`, {
+      signal: controller.signal,
+      headers: { 'Accept': 'application/json', 'User-Agent': 'THIS-PERSON-IS-BRAND-Shortener/7.20' }
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const code = validCountryCode(data.country) ? String(data.country).toUpperCase() : 'XX';
+    if (code === 'XX') return null;
+
+    const value = {
+      countryCode: code,
+      country: countryInfo(code).name,
+      city: String(data.city || ''),
+      region: String(data.region || ''),
+      source: 'ipinfo'
+    };
+    geoCache.set(ip, { value, expiresAt: Date.now() + GEO_CACHE_TTL_MS });
+    if (geoCache.size > 10000) {
+      const first = geoCache.keys().next().value;
+      if (first) geoCache.delete(first);
+    }
+    return value;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveVisitorGeo(req, ip) {
+  // Highest-priority country signal when traffic really passes through Cloudflare.
+  const cfCountry = getCloudflareCountry(req);
+
+  // Optional premium/current external lookup when token is configured.
+  const remote = await ipinfoLookup(ip);
+  const local = localGeoLookup(ip);
+
+  if (cfCountry) {
+    return {
+      countryCode: cfCountry,
+      country: countryInfo(cfCountry).name,
+      city: remote?.city || local?.city || '',
+      region: remote?.region || local?.region || '',
+      source: 'cloudflare'
+    };
+  }
+
+  if (remote) return remote;
+  if (local && local.countryCode !== 'XX') return local;
+
+  return { countryCode:'XX', country:'Unknown', city:'', region:'', source:'unknown' };
+}
+function normalizeHost(host){ return String(host||'').split(':')[0].toLowerCase().replace(/^www\./,''); }
+function domainOrigin(domain){ const clean=normalizeHost(domain); return clean===normalizeHost(BASE_HOST)?BASE_URL:`https://${clean}`; }
+function getBaseUrl(req){ const host=normalizeHost(req.get('host')); return AVAILABLE_DOMAINS.map(normalizeHost).includes(host)?domainOrigin(host):BASE_URL; }
+function buildShortUrl(link){ return `${domainOrigin(normalizeHost(link.selectedDomain||BASE_HOST))}/${link.shortCode}`; }
+
+function buildGoogleStyleShortUrl(link){
+  return `${domainOrigin(normalizeHost(link.selectedDomain||BASE_HOST))}/share.google?q=${encodeURIComponent(link.shortCode)}`;
+}
+
+function escapeHtml(v){ return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;'); }
+
+function sha256(v){ return crypto.createHash('sha256').update(String(v)).digest('hex'); }
+function makeApiKey(){ return 'tpib_live_' + crypto.randomBytes(24).toString('hex'); }
+function hashLinkPassword(password){
+  const salt=crypto.randomBytes(16).toString('hex');
+  const hash=crypto.scryptSync(String(password),salt,64).toString('hex');
+  return `${salt}:${hash}`;
+}
+function verifyLinkPassword(password,stored){
+  try{
+    const [salt,expected]=String(stored||'').split(':');
+    if(!salt||!expected)return false;
+    const actual=crypto.scryptSync(String(password),salt,64);
+    const exp=Buffer.from(expected,'hex');
+    return exp.length===actual.length && crypto.timingSafeEqual(exp,actual);
+  }catch(e){ return false; }
+}
+function isPrivateHostname(host){
+  const h=String(host||'').toLowerCase();
+  return h==='localhost'||h==='127.0.0.1'||h==='0.0.0.0'||h==='::1'||
+    /^10\./.test(h)||/^192\.168\./.test(h)||/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)||
+    h.endsWith('.local')||h.endsWith('.internal');
+}
+function validateDestinationUrl(raw){
+  try{
+    const u=new URL(String(raw||''));
+    if(!['http:','https:'].includes(u.protocol)) return 'Only http:// or https:// links are allowed.';
+    if(u.username || u.password) return 'URLs containing embedded usernames/passwords are not allowed.';
+    const host=normalizeHost(u.hostname);
+    if(!host) return 'Invalid destination host.';
+    if(isPrivateHostname(host) || host==='[::1]' || /^169\.254\./.test(host)) return 'Private/local network URLs are not allowed.';
+    if(AVAILABLE_DOMAINS.map(normalizeHost).includes(host)) return 'Shortener domains cannot be used as destination URLs.';
+    if(BLOCKED_DOMAINS.includes(host) || BLOCKED_DOMAINS.some(d=>host.endsWith('.'+d))) return 'This destination domain is blocked by the administrator.';
+    if(String(raw).length>4096) return 'Destination URL is too long.';
+    return null;
+  }catch(e){ return 'Invalid URL format.'; }
+}
+async function notifyUser(userId,title,message,type='info'){
+  await pool.query('INSERT INTO notifications(user_id,title,message,type) VALUES($1,$2,$3,$4)',
+    [userId,String(title).slice(0,160),String(message).slice(0,2000),String(type).slice(0,30)]);
+}
+async function auditAdmin(req,action,targetType='',targetId='',details=''){
+  try{
+    await pool.query(`INSERT INTO admin_audit_logs(admin_email,action,target_type,target_id,details,ip_address)
+      VALUES($1,$2,$3,$4,$5,$6)`,
+      [ADMIN_EMAIL,String(action),String(targetType),String(targetId),String(details).slice(0,4000),getRealClientIp(req)]);
+  }catch(e){ console.error('Audit log error:',e.message); }
+}
+async function getEnabledDomains(){
+  const q=await pool.query('SELECT domain FROM domain_settings WHERE enabled=TRUE AND maintenance=FALSE ORDER BY domain=$1 DESC, domain ASC',[normalizeHost(BASE_HOST)]);
+  const list=q.rows.map(r=>normalizeHost(r.domain)).filter(d=>AVAILABLE_DOMAINS.map(normalizeHost).includes(d));
+  return list.length ? list : [normalizeHost(BASE_HOST)];
+}
+async function getDomainChoices(){
+  const xyzDomain='thispersonisbrandshortner.xyz';
+  const q=await pool.query(
+    'SELECT domain,enabled,maintenance,last_health FROM domain_settings ORDER BY CASE WHEN LOWER(domain)=LOWER($1) THEN 0 ELSE 1 END, domain ASC',
+    [xyzDomain]
+  );
+  const configured=new Set(AVAILABLE_DOMAINS.map(normalizeHost));
+  return q.rows.filter(r=>configured.has(normalizeHost(r.domain))).map(r=>({
+    domain:normalizeHost(r.domain),enabled:!!r.enabled,maintenance:!!r.maintenance,lastHealth:r.last_health||'unknown',
+    selectable:!!r.enabled && !r.maintenance
+  }));
+}
+
+function getDomainChoicesForUser(user, choices){
+  const all = Array.isArray(choices) ? choices : [];
+  if(user && user.isPremium) return all.map(d=>({...d,planRestricted:false}));
+  return all.map(d=>{
+    const allowed = FREE_PLAN_DOMAINS.has(normalizeHost(d.domain));
+    return {
+      ...d,
+      selectable: !!d.selectable && allowed,
+      planRestricted: !allowed
+    };
+  });
+}
+
+async function isDomainEnabled(domain){
+  const d=normalizeHost(domain);
+  const q=await pool.query('SELECT enabled,maintenance FROM domain_settings WHERE domain=$1',[d]);
+  return q.rowCount ? (!!q.rows[0].enabled && !q.rows[0].maintenance) : d===normalizeHost(BASE_HOST);
+}
+async function authenticateApiKey(req,res,next){
+  try{
+    const raw=String(req.get('x-api-key')||req.get('authorization')||'').replace(/^Bearer\s+/i,'').trim();
+    if(!raw) return res.status(401).json({error:'API key required'});
+    const hash=sha256(raw);
+    const q=await pool.query('SELECT * FROM users WHERE api_key_hash=$1 LIMIT 1',[hash]);
+    if(!q.rowCount) return res.status(401).json({error:'Invalid or revoked API key'});
+    const user=mapUser(q.rows[0]);
+    if(user.accountStatus==='blocked') return res.status(403).json({error:'Account blocked'});
+    if(!user.isPremium) return res.status(403).json({error:'Premium plan required for API access'});
+    if(!user.apiAdminEnabled) return res.status(403).json({error:'API access has been disabled by administrator'});
+    if(!user.apiEnabled) return res.status(403).json({error:'API access is turned off. Enable it from API Access settings.'});
+    req.apiUser=user;
+    next();
+  }catch(e){ console.error('API auth error:',e); res.status(500).json({error:'API authentication error'}); }
+}
+async function createBackupSnapshot(createdBy='automatic'){
+  const [users,links,clicks,payments,domains,notifications]=await Promise.all([
+    pool.query(`SELECT id,telegram_id,username,first_name,last_name,display_name,email,timezone,account_status,created_at,last_login,total_links,lifetime_links_created,total_clicks,is_admin,plan_type,premium_until,api_enabled,api_admin_enabled,api_key_prefix FROM users ORDER BY id`),
+    pool.query('SELECT * FROM links ORDER BY id'),
+    pool.query('SELECT * FROM clicks ORDER BY id DESC LIMIT 100000'),
+    pool.query(`SELECT id,user_id,plan_months,amount,method,transaction_id,status,admin_note,created_at,reviewed_at FROM payments ORDER BY id`),
+    pool.query('SELECT * FROM domain_settings ORDER BY domain'),
+    pool.query('SELECT * FROM notifications ORDER BY id DESC LIMIT 10000')
+  ]);
+  const payload={version:'6.6',createdAt:new Date().toISOString(),users:users.rows,links:links.rows,clicks:clicks.rows,payments:payments.rows,domains:domains.rows,notifications:notifications.rows};
+  await pool.query('INSERT INTO app_backups(backup_data,created_by) VALUES($1::jsonb,$2)',[JSON.stringify(payload),createdBy]);
+  await pool.query(`DELETE FROM app_backups WHERE id NOT IN (SELECT id FROM app_backups ORDER BY created_at DESC LIMIT 7)`);
+  return payload;
+}
+async function getActiveAnnouncement(){
+  try{
+    const q=await pool.query("SELECT id,message,updated_at FROM announcements WHERE is_active=TRUE ORDER BY updated_at DESC,id DESC LIMIT 1");
+    return q.rowCount?q.rows[0]:null;
+  }catch(e){ console.error('Announcement load error:',e.message); return null; }
+}
+async function maybeCreateAutomaticBackup(){
+  try{
+    const q=await pool.query("SELECT created_at FROM app_backups WHERE created_by='automatic' ORDER BY created_at DESC LIMIT 1");
+    const last=q.rowCount?new Date(q.rows[0].created_at).getTime():0;
+    if(!last || Date.now()-last >= AUTO_BACKUP_HOURS*3600000) {
+      await createBackupSnapshot('automatic');
+      console.log('✅ Automatic app snapshot created');
+    }
+  }catch(e){ console.error('Automatic backup error:',e.message); }
+}
+function renderSocialPreview(req,res,link){
+  const shortUrl=buildShortUrl(link), host=normalizeHost(link.selectedDomain||req.get('host')||BASE_HOST), title=host, description=PREVIEW_DESCRIPTION;
+  res.set('Cache-Control','public, max-age=300');
+  return res.status(200).type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)}</title><meta name="description" content="${escapeHtml(description)}"><link rel="canonical" href="${escapeHtml(shortUrl)}"><meta property="og:type" content="website"><meta property="og:site_name" content="${escapeHtml(title)}"><meta property="og:title" content="${escapeHtml(title)}"><meta property="og:description" content="${escapeHtml(description)}"><meta property="og:url" content="${escapeHtml(shortUrl)}"><meta name="twitter:card" content="summary"><meta name="twitter:title" content="${escapeHtml(title)}"><meta name="twitter:description" content="${escapeHtml(description)}"></head><body></body></html>`);
+}
+
+async function getUserById(id){ const r=await pool.query('SELECT * FROM users WHERE id=$1',[id]); return mapUser(r.rows[0]); }
+async function getAdminState(req) {
+  if (req.session?.admin === true) return true;
+  if (req.session?.user?.id) {
+    const u = await getUserById(req.session.user.id);
+    return !!u?.isAdmin;
+  }
+  return false;
+}
+async function adminMiddleware(req,res,next){
+  try {
+    if (await getAdminState(req)) return next();
+    return res.redirect('/admin/login');
+  } catch(e) {
+    console.error('Admin auth error:', e);
+    return res.redirect('/admin/login?error=' + encodeURIComponent('Admin authentication failed'));
+  }
+}
+function expectedPlanAmount(months){
+  const m=Number(months);
+  if(m===12) return PLAN_12_PRICE;
+  if(m===3) return PLAN_3_PRICE;
+  return PLAN_1_PRICE;
+}
+function paymentConfig(){ return {
+  bkashNumber:BKASH_NUMBER, nagadNumber:NAGAD_NUMBER, binanceId:BINANCE_ID,
+  bkashConfigured:!!BKASH_NUMBER, nagadConfigured:!!NAGAD_NUMBER, binanceConfigured:!!BINANCE_ID
+}; }
+
+async function getActiveOnlineUsers(){
+  await pool.query("DELETE FROM online_users WHERE last_seen < NOW() - INTERVAL '5 minutes'");
+  const r=await pool.query('SELECT * FROM online_users ORDER BY last_seen DESC'); return r.rows.map(mapOnline);
+}
+async function markOnline(user){
+  if(!user) return;
+  await pool.query(`INSERT INTO online_users(user_id,username,display_name,last_seen) VALUES($1,$2,$3,NOW())
+    ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, display_name=EXCLUDED.display_name, last_seen=NOW()`,[user.id,user.username||'',user.displayName||'']);
+}
+
+async function authMiddleware(req,res,next){
+  try {
+    if(req.session?.user?.id){
+      const user=await getUserById(req.session.user.id);
+      if(user){
+        if (user.accountStatus === 'blocked') {
+          delete req.session.user;
+          return req.session.save(() => res.redirect('/login?error=' + encodeURIComponent('Your account is blocked. Contact admin.')));
+        }
+        req.user=user;
+        return next();
+      }
+
+      // Session may survive a deploy even when the old user row no longer exists.
+      // Clear that stale user session before redirecting to login.
+      delete req.session.user;
+      if(req.originalUrl!=='/login') req.session.returnTo=req.originalUrl;
+      return req.session.save((err)=>{
+        if(err) console.error('Stale session save error:',err);
+        res.redirect('/login');
+      });
+    }
+
+    if(req.originalUrl!=='/login') req.session.returnTo=req.originalUrl;
+    return res.redirect('/login');
+  } catch(e){
+    console.error('Auth error:',e);
+    return res.redirect('/login?error='+encodeURIComponent('Database connection error'));
+  }
+}
+
+// ===== ONLINE HEARTBEAT =====
+// Never write to online_users until the referenced user is confirmed to exist.
+// This prevents foreign-key errors from stale PostgreSQL sessions after migration/redeploy.
+app.use(async (req,res,next)=>{
+  if(!req.session?.user?.id) return next();
+
+  try {
+    const user=await getUserById(req.session.user.id);
+
+    if(!user){
+      console.warn(`⚠️ Stale session cleared for missing user id ${req.session.user.id}`);
+      delete req.session.user;
+      return req.session.save((err)=>{
+        if(err) console.error('Stale session cleanup error:',err);
+        next();
+      });
+    }
+
+    await markOnline(user);
+  } catch(e){
+    console.error('Online heartbeat error:',e.message);
+  }
+
+  next();
+});
+
+
+async function getPublicLiveStats(){
+  const q=await pool.query(`SELECT
+    (SELECT COUNT(*) FROM users)::bigint AS users,
+    (SELECT COUNT(*) FROM links)::bigint AS links,
+    (SELECT COALESCE(SUM(clicks),0) FROM links)::bigint AS real_clicks,
+    (SELECT COUNT(*) FROM clicks)::bigint AS all_requests,
+    (SELECT COUNT(*) FROM site_visitors)::bigint AS website_visitors,
+    (SELECT COALESCE(SUM(page_views),0) FROM site_visitors)::bigint AS page_views,
+    (SELECT COUNT(*) FROM site_visitors WHERE last_seen > NOW()-INTERVAL '2 minutes')::bigint AS live_visitors`);
+  const r=q.rows[0]||{};
+  return {
+    users:Number(r.users||0),
+    links:Number(r.links||0),
+    realClicks:Number(r.real_clicks||0),
+    allRequests:Number(r.all_requests||0),
+    websiteVisitors:Number(r.website_visitors||0),
+    pageViews:Number(r.page_views||0),
+    liveVisitors:Number(r.live_visitors||0)
+  };
+}
+
+function isLikelyAutomatedRequest(req,ua){
+  const agent=String(ua||'');
+  const purpose=String(req.get('purpose')||req.get('sec-purpose')||req.get('x-purpose')||'').toLowerCase();
+  const secFetchMode=String(req.get('sec-fetch-mode')||'').toLowerCase();
+  const secFetchDest=String(req.get('sec-fetch-dest')||'').toLowerCase();
+  const secFetchSite=String(req.get('sec-fetch-site')||'').toLowerCase();
+  if(req.method==='HEAD') return true;
+  if(!agent.trim()) return true;
+  if(isBot(agent)||isSocialPreviewBot(agent)) return true;
+  if(/prefetch|preview|prerender/.test(purpose)) return true;
+  if(secFetchDest==='empty' && /prefetch|prerender/.test(purpose)) return true;
+  // Do not classify normal browser navigations as bots just because they have no referrer.
+  return false;
+}
+
+function parseGoogleShareInput(raw){
+  try{
+    const u=new URL(String(raw||'').trim());
+    const host=normalizeHost(u.hostname);
+
+    if(host==='share.google'||host==='search.app'){
+      const token=u.pathname.split('/').filter(Boolean)[0]||'';
+      if(!/^[A-Za-z0-9_-]{4,200}$/.test(token)) return {error:'Invalid Google share token'};
+      return {
+        token,
+        shortGoogleUrl:`https://${host}/${token}`,
+        convertedUrl:`https://www.google.com/share.google?q=${encodeURIComponent(token)}`
+      };
+    }
+
+    if(host==='google.com'){
+      const q=u.searchParams.get('q')||'';
+      if(u.pathname==='/share.google' && /^[A-Za-z0-9_-]{4,200}$/.test(q)){
+        return {
+          token:q,
+          shortGoogleUrl:`https://share.google/${q}`,
+          convertedUrl:`https://www.google.com/share.google?q=${encodeURIComponent(q)}`
+        };
+      }
+    }
+
+    return {error:'Paste a share.google or search.app short link generated by the Google app.'};
+  }catch(_){
+    return {error:'Enter a valid URL.'};
+  }
+}
+
+
+app.use(async(req,res,next)=>{
+  if(req.path.startsWith('/health')||req.path.startsWith('/api/live-stats')||req.path.startsWith('/favicon')) return next();
+  try{
+    let visitorId=req.session.visitorId;
+    if(!visitorId){
+      visitorId=crypto.randomBytes(16).toString('hex');
+      req.session.visitorId=visitorId;
+    }
+    const ip=getRealClientIp(req);
+    const ua=String(req.headers['user-agent']||'').slice(0,1000);
+    const uid=req.session?.user?.id||null;
+    const cfCode=getCloudflareCountry(req);
+    const info=cfCode?countryInfo(cfCode):{name:'Unknown'};
+    await pool.query(`INSERT INTO site_visitors(visitor_id,user_id,ip_address,user_agent,last_path,country,country_code)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT(visitor_id) DO UPDATE SET
+        user_id=COALESCE(EXCLUDED.user_id,site_visitors.user_id),
+        ip_address=EXCLUDED.ip_address,
+        user_agent=EXCLUDED.user_agent,
+        last_seen=NOW(),
+        page_views=site_visitors.page_views+1,
+        last_path=EXCLUDED.last_path,
+        country=CASE WHEN EXCLUDED.country_code<>'XX' THEN EXCLUDED.country ELSE site_visitors.country END,
+        country_code=CASE WHEN EXCLUDED.country_code<>'XX' THEN EXCLUDED.country_code ELSE site_visitors.country_code END`,
+      [visitorId,uid,ip,ua,String(req.path||'/').slice(0,500),cfCode?info.name:'Unknown',cfCode||'XX']);
+  }catch(err){console.error('Website visitor tracking error:',err.message);}
+  next();
+});
+
+app.get('/api/live-stats',async(req,res)=>{
+  try{res.set('Cache-Control','no-store');res.json(await getPublicLiveStats());}
+  catch(err){res.status(500).json({error:'Live stats unavailable'});}
+});
+
+// ===== HOME =====
+app.get('/', async (req,res)=>{
+  try {
+    const [activeUsers,totalR,recentR,liveStats] = await Promise.all([
+      getActiveOnlineUsers(), pool.query('SELECT COUNT(*)::int AS count FROM users'),
+      pool.query('SELECT * FROM users ORDER BY created_at DESC LIMIT 30'), getPublicLiveStats()
+    ]);
+    const loggedUser=req.session?.user?.id?await getUserById(req.session.user.id):null;
+    res.render('index',{page:'home',user:loggedUser,onlineUsers:activeUsers.length,onlineUserList:activeUsers.map(u=>({name:u.displayName||u.username||'User'})),totalUsers:Number(totalR.rows[0].count),liveStats,registeredUserList:recentR.rows.map(mapUser).map(u=>({name:u.displayName||[u.firstName,u.lastName].filter(Boolean).join(' ')||u.username||'User',username:u.username||''})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+  }catch(e){ console.error('Home error:',e); res.status(500).send('Database error: '+e.message); }
+});
+
+// ===== LOGIN =====
+app.get('/login',async(req,res)=>{
+  try {
+    if(req.session?.user?.id){ const u=await getUserById(req.session.user.id); if(u) return res.redirect('/dashboard'); }
+    const [activeUsers,totalR]=await Promise.all([getActiveOnlineUsers(),pool.query('SELECT COUNT(*)::int AS count FROM users')]);
+    res.render('index',{page:'login',user:null,onlineUsers:activeUsers.length,onlineUserList:activeUsers.map(u=>({name:u.displayName||u.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:req.query.shortUrl||null,totalUsers:Number(totalR.rows[0].count),customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:getBaseUrl(req)});
+  }catch(e){ console.error('Login page error:',e); res.status(500).send('Login page error: '+e.message); }
+});
+
+app.post('/login',async(req,res)=>{
+  try {
+    const {telegramId,username,firstName,lastName,email,timezone}=req.body;
+    if(!telegramId||!username||!firstName) return res.redirect('/login?error='+encodeURIComponent('Please fill in all required fields'));
+    const displayName=firstName+(lastName?' '+lastName:'');
+    const q=await pool.query(`INSERT INTO users(telegram_id,username,first_name,last_name,display_name,email,timezone,last_login)
+      VALUES($1,$2,$3,$4,$5,$6,$7,NOW())
+      ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username,first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,display_name=EXCLUDED.display_name,email=CASE WHEN EXCLUDED.email<>'' THEN EXCLUDED.email ELSE users.email END,timezone=EXCLUDED.timezone,last_login=NOW()
+      RETURNING *`,[String(telegramId),String(username),String(firstName),String(lastName||''),displayName,String(email||''),String(timezone||'Asia/Dhaka')]);
+    let user=mapUser(q.rows[0]);
+    if (ADMIN_EMAIL && String(user.email || '').toLowerCase() === ADMIN_EMAIL && !user.isAdmin) {
+      const adminRow = await pool.query('UPDATE users SET is_admin=TRUE WHERE id=$1 RETURNING *',[user.id]);
+      user = mapUser(adminRow.rows[0]);
+    }
+    if (user.accountStatus === 'blocked') return res.redirect('/login?error=' + encodeURIComponent('Your account is blocked. Contact admin.'));
+    await markOnline(user);
+    req.session.user={id:user.id,telegramId:user.telegramId,username:user.username,displayName:user.displayName,firstName:user.firstName,email:user.email,profilePhoto:user.profilePhoto,timezone:user.timezone,isAdmin:user.isAdmin};
+    const requested=req.session.returnTo; const returnTo=requested&&requested!=='/login'&&requested.startsWith('/')?requested:'/dashboard'; delete req.session.returnTo;
+    return req.session.save(err=>{ if(err){console.error('Session save error:',err);return res.redirect('/login?error='+encodeURIComponent('Could not save login session'));} res.redirect(returnTo); });
+  }catch(e){ console.error('Login error:',e); res.redirect('/login?error='+encodeURIComponent('Login failed: '+e.message)); }
+});
+
+app.post('/logout',async(req,res)=>{
+  try { if(req.session?.user?.id) await pool.query('DELETE FROM online_users WHERE user_id=$1',[req.session.user.id]); } catch(e){}
+  req.session.destroy(()=>res.redirect('/'));
+});
+
+// ===== DASHBOARD =====
+app.get('/dashboard',authMiddleware,async(req,res)=>{
+  try {
+    const freshUser=await getUserById(req.user.id);
+    const linkR=await pool.query('SELECT * FROM links WHERE user_id=$1 ORDER BY created_at DESC',[req.user.id]);
+    const links=linkR.rows.map(mapLink).map(l=>({...l,shortUrl:l.linkType==='google_style'?buildGoogleStyleShortUrl(l):buildShortUrl(l)}));
+    const linkUsage=freshUser.isPremium ? links.length : Number(freshUser.lifetimeLinksCreated || 0);
+    const linksRemaining=freshUser.isPremium?null:Math.max(0,FREE_LINK_LIMIT-linkUsage);
+    const clickR=await pool.query('SELECT * FROM clicks WHERE user_id=$1 ORDER BY created_at DESC',[req.user.id]);
+    const clicks=clickR.rows.map(mapClick);
+    let totalClicks=0,todayClicks=0,yesterdayClicks=0,weekClicks=0,monthClicks=0,yearClicks=0,botClicks=0;
+    const now=new Date(),today=new Date(now);today.setHours(0,0,0,0);
+    const yesterday=new Date(today);yesterday.setDate(yesterday.getDate()-1);
+    const weekAgo=new Date(today);weekAgo.setDate(weekAgo.getDate()-7);
+    const monthAgo=new Date(today);monthAgo.setDate(monthAgo.getDate()-30);
+    const yearStart=new Date(today.getFullYear(),0,1);
+    const countryMap={},deviceMap={},referrerMap={},browserMap={},uniqueIps=new Set(),weekData=[0,0,0,0,0,0,0];
+
+    // V7.6 graph series: exact last 7 calendar days. Existing weekData remains unchanged.
+    const chartDays=[];
+    for(let i=6;i>=0;i--){
+      const cd=new Date(today);
+      cd.setDate(cd.getDate()-i);
+      const key=`${cd.getFullYear()}-${String(cd.getMonth()+1).padStart(2,'0')}-${String(cd.getDate()).padStart(2,'0')}`;
+      chartDays.push({
+        key,
+        date: cd.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'}),
+        day: cd.toLocaleDateString('en-US',{weekday:'long'}),
+        clicks:0
+      });
+    }
+    const chartDayMap=new Map(chartDays.map((d,i)=>[d.key,i]));
+
+    for(const click of clicks){
+      if(click.isBot){botClicks++;continue;} totalClicks++; const d=new Date(click.createdAt);
+      if(click.ipAddress) uniqueIps.add(click.ipAddress);
+      const clickKey=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      if(chartDayMap.has(clickKey)) chartDays[chartDayMap.get(clickKey)].clicks++;
+      if(d>=today)todayClicks++; else if(d>=yesterday && d<today)yesterdayClicks++;
+      if(d>=weekAgo){weekClicks++;const di=d.getDay(),ai=di===0?6:di-1;weekData[ai]++;}
+      if(d>=monthAgo)monthClicks++; if(d>=yearStart)yearClicks++;
+      const rf=click.referrer||'Direct'; referrerMap[rf]=(referrerMap[rf]||0)+1;
+      const br=click.browser||'Unknown'; browserMap[br]=(browserMap[br]||0)+1;
+      const cc=click.countryCode||'XX';countryMap[cc]=(countryMap[cc]||0)+1; const dk=(click.device||'Unknown')+'|'+(click.browser||'Unknown')+'|'+(click.os||'Unknown'); if(!deviceMap[dk])deviceMap[dk]={device:click.device,browser:click.browser,os:click.os,count:0};deviceMap[dk].count++;
+    }
+    const realClicks=totalClicks,clickRate=(totalClicks+botClicks)>0?Math.round(totalClicks/(totalClicks+botClicks)*100):0;
+    const countryStats=Object.entries(countryMap).map(([countryCode,count])=>({countryCode,count})).sort((a,b)=>b.count-a.count).slice(0,15);
+    const deviceStats=Object.values(deviceMap).sort((a,b)=>b.count-a.count).slice(0,20);
+    const topReferrers=Object.entries(referrerMap).map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count).slice(0,8);
+    const browserStats=Object.entries(browserMap).map(([name,count])=>({name,count})).sort((a,b)=>b.count-a.count).slice(0,8);
+    const uniqueClicks=uniqueIps.size;
+    const activeUsers=await getActiveOnlineUsers();
+    const allDomainChoices=await getDomainChoices();
+    const domainChoices=getDomainChoicesForUser(freshUser,allDomainChoices);
+    const dashboardDomains=domainChoices.filter(d=>d.selectable).map(d=>d.domain);
+    res.render('index',{page:'dashboard',user:freshUser,links,totalClicks,todayClicks,yesterdayClicks,weekClicks,monthClicks,yearClicks,uniqueClicks,topReferrers,browserStats,botClicks,realClicks,clickRate,onlineUsers:activeUsers.length,countryStats,deviceStats,weekData,chartDays,countries,onlineUserList:activeUsers.map(u=>({name:u.displayName||u.username||'User'})),freeLinkLimit:FREE_LINK_LIMIT,linkUsage,linksRemaining,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:dashboardDomains.filter(d=>d!==normalizeHost(BASE_HOST)),availableDomains:dashboardDomains,domainChoices,baseDomain:BASE_HOST,baseUrl:getBaseUrl(req)});
+  }catch(e){ console.error('Dashboard error:',e); res.redirect('/?error='+encodeURIComponent('Dashboard database error')); }
+});
+
+// ===== MY LINKS PAGE =====
+app.get('/my-links',authMiddleware,async(req,res)=>{
+  try{
+    const freshUser=await getUserById(req.user.id);
+    const r=await pool.query('SELECT * FROM links WHERE user_id=$1 ORDER BY created_at DESC',[req.user.id]);
+    const links=r.rows.map(mapLink).map(l=>({...l,shortUrl:l.linkType==='google_style'?buildGoogleStyleShortUrl(l):buildShortUrl(l)}));
+    const active=await getActiveOnlineUsers();
+    const domainChoices=await getDomainChoices();
+    const enabledDomains=domainChoices.filter(d=>d.selectable).map(d=>d.domain);
+    res.render('index',{page:'my-links',user:freshUser,links,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:enabledDomains.filter(d=>d!==normalizeHost(BASE_HOST)),availableDomains:enabledDomains,domainChoices,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+  }catch(e){console.error('My links page error:',e);res.redirect('/dashboard?error='+encodeURIComponent('Could not load your short links.'));}
+});
+
+
+// ===== PER-LINK ANALYTICS =====
+app.get('/links/:id/stats',authMiddleware,async(req,res)=>{
+  try{
+    const freshUser=await getUserById(req.user.id);
+    const linkR=await pool.query('SELECT * FROM links WHERE id=$1 AND user_id=$2 LIMIT 1',[req.params.id,req.user.id]);
+    if(!linkR.rowCount) return res.redirect('/my-links?error='+encodeURIComponent('Link not found.'));
+    const link=mapLink(linkR.rows[0]);
+    link.shortUrl=link.linkType==='google_style'?buildGoogleStyleShortUrl(link):buildShortUrl(link);
+    const clickR=await pool.query('SELECT * FROM clicks WHERE link_id=$1 ORDER BY created_at DESC',[link.id]);
+    const clicks=clickR.rows.map(mapClick);
+    const realClicks=clicks.filter(c=>!c.isBot);
+    const perLinkBotClicks=clicks.filter(c=>c.isBot).length;
+    const uniqueVisitors=new Set(realClicks.map(c=>c.ipAddress).filter(Boolean)).size;
+    const countryMap={};
+    for(const c of realClicks){
+      const cc=String(c.countryCode||'XX').toUpperCase();
+      if(!countryMap[cc]) countryMap[cc]={countryCode:cc,country:c.country||countryInfo(cc).name,count:0};
+      countryMap[cc].count++;
+    }
+    const countryStats=Object.values(countryMap).sort((a,b)=>b.count-a.count);
+    const today=new Date();today.setHours(0,0,0,0);
+    const chartDays=[];
+    for(let i=13;i>=0;i--){const d=new Date(today);d.setDate(d.getDate()-i);const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;chartDays.push({key,label:d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}),clicks:0});}
+    const dayMap=new Map(chartDays.map((d,i)=>[d.key,i]));
+    for(const c of realClicks){const d=new Date(c.createdAt);const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;if(dayMap.has(key))chartDays[dayMap.get(key)].clicks++;}
+    const active=await getActiveOnlineUsers();
+    res.render('index',{page:'link-stats',user:freshUser,link,linkClicks:realClicks,totalLinkClicks:realClicks.length,perLinkBotClicks,uniqueVisitors,countryStats,chartDays,countries,
+      onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),error:null,success:null,info:null,shortUrl:null,
+      customDomains:[],availableDomains:[],domainChoices:[],baseDomain:BASE_HOST,baseUrl:getBaseUrl(req)});
+  }catch(e){console.error('Per-link stats error:',e);res.redirect('/my-links?error='+encodeURIComponent('Could not load link statistics.'));}
+});
+
+
+async function getGoogleStyleAnalytics(userId){
+  const [linksR,clicksR]=await Promise.all([
+    pool.query("SELECT * FROM links WHERE user_id=$1 AND link_type='google_style' ORDER BY created_at DESC LIMIT 100",[userId]),
+    pool.query(`SELECT c.* FROM clicks c
+                JOIN links l ON l.id=c.link_id
+                WHERE l.user_id=$1 AND l.link_type='google_style'
+                ORDER BY c.created_at DESC LIMIT 5000`,[userId])
+  ]);
+
+  const googleStyleLinks=linksR.rows.map(mapLink).map(l=>({...l,shortUrl:buildGoogleStyleShortUrl(l)}));
+  const clicks=clicksR.rows.map(mapClick);
+  const realClicks=clicks.filter(c=>!c.isBot);
+  const botClicks=clicks.filter(c=>c.isBot);
+  const uniqueVisitors=new Set(realClicks.map(c=>c.ipAddress).filter(Boolean)).size;
+
+  const countryMap={};
+  for(const c of realClicks){
+    const cc=String(c.countryCode||'XX').toUpperCase();
+    if(!countryMap[cc]) countryMap[cc]={countryCode:cc,country:c.country||countryInfo(cc).name,count:0};
+    countryMap[cc].count++;
+  }
+  const countryStats=Object.values(countryMap).sort((a,b)=>b.count-a.count).slice(0,10);
+
+  const today=new Date();today.setHours(0,0,0,0);
+  const chartDays=[];
+  for(let i=13;i>=0;i--){
+    const d=new Date(today);d.setDate(d.getDate()-i);
+    const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    chartDays.push({key,label:d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}),clicks:0});
+  }
+  const dayMap=new Map(chartDays.map((d,i)=>[d.key,i]));
+  for(const c of realClicks){
+    const d=new Date(c.createdAt);
+    const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    if(dayMap.has(key)) chartDays[dayMap.get(key)].clicks++;
+  }
+
+  return {
+    googleStyleLinks,
+    googleAnalytics:{
+      totalLinks:googleStyleLinks.length,
+      realClicks:realClicks.length,
+      uniqueVisitors,
+      countries:countryStats.length,
+      botClicks:botClicks.length,
+      countryStats,
+      chartDays,
+      recentClicks:realClicks.slice(0,20)
+    }
+  };
+}
+
+
+
+async function isToolMaintenanceOn(tool){
+  const key=tool==='x'?'x_tool_maintenance':'canva_tool_maintenance';
+  try{
+    const q=await pool.query('SELECT setting_value FROM site_settings WHERE setting_key=$1 LIMIT 1',[key]);
+    return !!q.rowCount && String(q.rows[0].setting_value||'').toLowerCase()==='on';
+  }catch(e){console.error('Tool maintenance read error:',tool,e.message);return false;}
+}
+function toolMaintenanceHtml(tool){
+  const isX=tool==='x',title=isX?'X Shortlink':'Canva Shortlink',icon=isX?'𝕏':'🎨';
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>${title} Maintenance</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;font-family:Inter,Arial,sans-serif;color:#eef4ff;background:radial-gradient(circle at 18% 20%,rgba(108,99,255,.22),transparent 32%),radial-gradient(circle at 82% 80%,rgba(39,215,255,.12),transparent 34%),#070d1f}.card{width:min(620px,100%);padding:34px 26px;border-radius:26px;text-align:center;background:rgba(18,28,58,.93);border:1px solid rgba(140,160,255,.22);box-shadow:0 30px 90px rgba(0,0,0,.48)}.icon{width:72px;height:72px;margin:0 auto 14px;border-radius:22px;display:grid;place-items:center;font-size:38px;font-weight:900;background:linear-gradient(135deg,rgba(124,92,255,.28),rgba(39,215,255,.14));border:1px solid rgba(124,92,255,.25)}.brand{font-weight:900;color:#9fe9ff}.card h1{font-size:clamp(28px,6vw,44px);margin:12px 0 8px}.card p{color:#aebbd5;line-height:1.7}.pill{display:inline-flex;gap:8px;align-items:center;margin-top:18px;padding:9px 14px;border-radius:999px;color:#ffe59a;background:rgba(255,205,80,.08);border:1px solid rgba(255,205,80,.18);font-weight:800}.contact{margin-top:18px;padding-top:16px;border-top:1px solid rgba(255,255,255,.08);color:#93a3c2}.contact a{display:inline-flex;margin-top:8px;padding:9px 14px;border-radius:999px;text-decoration:none;color:#fff;background:#168bd2;font-weight:800}small{display:block;margin-top:16px;color:#7181a3}</style></head><body><main class="card"><div class="icon">${icon}</div><div class="brand">THIS PERSON IS BRAND SHORTLINK</div><h1>${title} Under Maintenance</h1><p>Admin is currently maintaining this tool. The rest of the website remains available.</p><div class="pill">🛠 Tool maintenance in progress</div><div class="contact">Need an update?<br><a href="https://t.me/thispersonisbrand537" target="_blank">Message Admin @thispersonisbrand537</a></div><small>This page checks again every 20 seconds.</small></main></body></html>`;
+}
+
+function xConfigured(){return !!(X_CLIENT_ID&&X_CLIENT_SECRET&&X_REDIRECT_URI);}
+async function getXSettings(){const q=await pool.query("SELECT setting_key,setting_value FROM site_settings WHERE setting_key IN ('x_access_token','x_refresh_token','x_token_expires_at','x_username','x_user_id')");const o={x_access_token:'',x_refresh_token:'',x_token_expires_at:'',x_username:'',x_user_id:''};q.rows.forEach(r=>o[r.setting_key]=String(r.setting_value||''));return o;}
+async function setX(k,v,by='system'){await pool.query(`INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by) VALUES($1,$2,NOW(),$3) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW(),updated_by=EXCLUDED.updated_by`,[k,String(v||''),by]);}
+async function saveXToken(j,by){if(j.access_token)await setX('x_access_token',j.access_token,by);if(j.refresh_token)await setX('x_refresh_token',j.refresh_token,by);if(j.expires_in)await setX('x_token_expires_at',new Date(Date.now()+Number(j.expires_in)*1000).toISOString(),by);}
+async function getValidXToken(){if(!xConfigured())throw new Error('X API is not configured.');let x=await getXSettings();const ex=Date.parse(x.x_token_expires_at||'');if(x.x_access_token&&Number.isFinite(ex)&&ex>Date.now()+60000)return x.x_access_token;if(!x.x_refresh_token)throw new Error('No X account connected.');const basic=Buffer.from(`${X_CLIENT_ID}:${X_CLIENT_SECRET}`).toString('base64');const body=new URLSearchParams({grant_type:'refresh_token',refresh_token:x.x_refresh_token,client_id:X_CLIENT_ID});const r=await fetch(X_TOKEN_URL,{method:'POST',headers:{Authorization:`Basic ${basic}`,'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error_description||j.detail||j.title||'X token refresh failed');await saveXToken(j,'auto-refresh');x=await getXSettings();return x.x_access_token;}
+function isCanvaUrl(v){try{const u=new URL(v);const host=u.hostname.toLowerCase();return host==='canva.com'||host==='www.canva.com'||host==='canva.site'||host==='www.canva.site'||host.endsWith('.canva.site')}catch(_){return false}}
+async function createToolLink(userId,originalUrl,domain,customSlug,type){let c;try{const d=normalizeHost(domain||BASE_HOST);if(!(await getEnabledDomains()).map(normalizeHost).includes(d))throw new Error('Selected domain is unavailable.');const bad=validateDestinationUrl(originalUrl);if(bad)throw new Error(bad);c=await pool.connect();await c.query('BEGIN');const ur=await c.query('SELECT * FROM users WHERE id=$1 FOR UPDATE',[userId]);if(!ur.rowCount)throw new Error('User not found');const u=mapUser(ur.rows[0]);if(!u.isPremium)throw new Error('Premium feature only.');let code=String(customSlug||'').trim();if(code){if(!/^[A-Za-z0-9_-]{2,80}$/.test(code))throw new Error('Invalid custom code');const ex=await c.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[d,code]);if(ex.rowCount)throw new Error('Code already exists');}else{for(let i=0;i<20;i++){const g=generateShortCode();const ex=await c.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[d,g]);if(!ex.rowCount){code=g;break}}if(!code)throw new Error('Could not generate code');}const q=await c.query(`INSERT INTO links(user_id,selected_domain,original_url,short_code,custom_slug,link_type) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[userId,d,originalUrl,code,customSlug||null,type]);await c.query('UPDATE users SET total_links=total_links+1,lifetime_links_created=lifetime_links_created+1 WHERE id=$1',[userId]);await c.query('COMMIT');return mapLink(q.rows[0]);}catch(e){if(c)try{await c.query('ROLLBACK')}catch(_){};throw e}finally{if(c)c.release();}}
+
+
+app.get('/x-shortlink',authMiddleware,async(req,res)=>{try{if((await isToolMaintenanceOn('x')) && !(await getAdminState(req)))return res.status(503).send(toolMaintenanceHtml('x'));const u=await getUserById(req.user.id);if(!u.isPremium)return res.redirect('/plans?error='+encodeURIComponent('X Shortlink is available to Premium users only.'));const active=await getActiveOnlineUsers(),choices=getDomainChoicesForUser(u,await getDomainChoices()),x=await getXSettings();res.render('index',{page:'x-shortlink',user:u,onlineUsers:active.length,onlineUserList:active.map(v=>({name:v.displayName||v.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:choices.filter(v=>v.selectable).map(v=>v.domain).filter(v=>v!==normalizeHost(BASE_HOST)),availableDomains:choices.filter(v=>v.selectable).map(v=>v.domain),domainChoices:choices,baseDomain:BASE_HOST,baseUrl:BASE_URL,xConfigured:xConfigured(),xConnected:!!x.x_access_token,xUsername:x.x_username,xOutput:req.query.xOutput||'',xOriginal:req.query.xOriginal||''});}catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Could not open X tool'));}});
+app.post('/x-shortlink/post',authMiddleware,async(req,res)=>{try{if((await isToolMaintenanceOn('x')) && !(await getAdminState(req)))return res.status(503).send(toolMaintenanceHtml('x'));const u=await getUserById(req.user.id);if(!u.isPremium)return res.redirect('/plans?error='+encodeURIComponent('Premium feature only.'));const url=String(req.body.originalUrl||'').trim(),caption=String(req.body.postText||'').trim();const bad=validateDestinationUrl(url);if(bad)return res.redirect('/x-shortlink?error='+encodeURIComponent(bad));const token=await getValidXToken();const text=(caption?caption+'\\n':'')+url;if(text.length>280)return res.redirect('/x-shortlink?error='+encodeURIComponent('Post text exceeds 280 characters.'));const r=await fetch(`${X_API_BASE}/tweets`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({text})});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||j.title||'X post failed');const x=await getXSettings();const id=j?.data?.id;if(!id)throw new Error('X did not return post ID');const out=`https://x.com/${x.x_username||'i'}/status/${id}`;await notifyUser(u.id,'X Post created',out,'success');res.redirect('/x-shortlink?success='+encodeURIComponent('X post created.')+'&xOutput='+encodeURIComponent(out)+'&xOriginal='+encodeURIComponent(url));}catch(e){res.redirect('/x-shortlink?error='+encodeURIComponent(e.message||'X failed'));}});
+app.get('/admin/x-connect',adminMiddleware,async(req,res)=>{try{if(!xConfigured())return res.redirect('/admin?error='+encodeURIComponent('Set X_CLIENT_ID, X_CLIENT_SECRET, X_REDIRECT_URI.'));const state=crypto.randomBytes(32).toString('base64url');req.session.xOAuthState=state;const u=new URL(X_AUTHORIZE_URL);u.searchParams.set('response_type','code');u.searchParams.set('client_id',X_CLIENT_ID);u.searchParams.set('redirect_uri',X_REDIRECT_URI);u.searchParams.set('scope',X_SCOPES);u.searchParams.set('state',state);u.searchParams.set('code_challenge',state);u.searchParams.set('code_challenge_method','plain');res.redirect(u.toString());}catch(e){res.redirect('/admin?error='+encodeURIComponent(e.message));}});
+app.get('/x/oauth/callback',adminMiddleware,async(req,res)=>{try{const code=String(req.query.code||''),state=String(req.query.state||'');if(!code||state!==String(req.session.xOAuthState||''))throw new Error('Invalid OAuth state');const basic=Buffer.from(`${X_CLIENT_ID}:${X_CLIENT_SECRET}`).toString('base64');const body=new URLSearchParams({grant_type:'authorization_code',code,redirect_uri:X_REDIRECT_URI,code_verifier:state,client_id:X_CLIENT_ID});const r=await fetch(X_TOKEN_URL,{method:'POST',headers:{Authorization:`Basic ${basic}`,'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error_description||j.detail||'Token exchange failed');await saveXToken(j,'admin-oauth');const me=await fetch(`${X_API_BASE}/users/me`,{headers:{Authorization:`Bearer ${j.access_token}`}});const mj=await me.json().catch(()=>({}));if(!me.ok||!mj.data)throw new Error('Could not read X account');await setX('x_username',mj.data.username||'','admin-oauth');await setX('x_user_id',mj.data.id||'','admin-oauth');delete req.session.xOAuthState;res.redirect('/admin?success='+encodeURIComponent(`Connected @${mj.data.username}`));}catch(e){res.redirect('/admin?error='+encodeURIComponent(e.message));}});
+app.post('/admin/x-disconnect',adminMiddleware,async(req,res)=>{try{for(const k of ['x_access_token','x_refresh_token','x_token_expires_at','x_username','x_user_id'])await setX(k,'',ADMIN_EMAIL||'admin');res.redirect('/admin?success='+encodeURIComponent('X disconnected'));}catch(e){res.redirect('/admin?error='+encodeURIComponent(e.message));}});
+app.get('/canva-shortlink',authMiddleware,async(req,res)=>{try{if((await isToolMaintenanceOn('canva')) && !(await getAdminState(req)))return res.status(503).send(toolMaintenanceHtml('canva'));const u=await getUserById(req.user.id);if(!u.isPremium)return res.redirect('/plans?error='+encodeURIComponent('Canva Shortlink is available to Premium users only.'));const active=await getActiveOnlineUsers(),choices=getDomainChoicesForUser(u,await getDomainChoices());res.render('index',{page:'canva-shortlink',user:u,onlineUsers:active.length,onlineUserList:active.map(v=>({name:v.displayName||v.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:req.query.shortUrl||null,customDomains:choices.filter(v=>v.selectable).map(v=>v.domain).filter(v=>v!==normalizeHost(BASE_HOST)),availableDomains:choices.filter(v=>v.selectable).map(v=>v.domain),domainChoices:choices,baseDomain:BASE_HOST,baseUrl:BASE_URL,canvaOriginal:req.query.canvaOriginal||'',createdLinkId:req.query.createdLinkId||null});}catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Could not open Canva tool'));}});
+app.post('/canva-shortlink/create',authMiddleware,async(req,res)=>{try{if((await isToolMaintenanceOn('canva')) && !(await getAdminState(req)))return res.status(503).send(toolMaintenanceHtml('canva'));const url=String(req.body.originalUrl||'').trim();if(!isCanvaUrl(url))return res.redirect('/canva-shortlink?error='+encodeURIComponent('Enter a valid Canva share/design URL.'));const link=await createToolLink(req.user.id,url,String(req.body.domain||BASE_HOST),String(req.body.customSlug||''),'canva');const out=buildShortUrl(link);res.redirect('/canva-shortlink?success='+encodeURIComponent('Canva link shortened.')+'&shortUrl='+encodeURIComponent(out)+'&canvaOriginal='+encodeURIComponent(url)+'&createdLinkId='+encodeURIComponent(link.id));}catch(e){res.redirect('/canva-shortlink?error='+encodeURIComponent(e.message));}});
+
+// ===== GOOGLE SHORTLINK TOOL =====
+// Google officially generates share.google/search.app short IDs inside the Google app.
+// There is no documented server API in this project for minting those Google-owned IDs.
+// This tool converts an existing Google short link into the wrapper format shown in the UI,
+// then lets the user shorten that converted URL on this shortener's own domains.
+app.get('/google-shortlink',authMiddleware,async(req,res)=>{
+  try{
+    const freshUser=await getUserById(req.user.id),active=await getActiveOnlineUsers();
+    if(!freshUser.isPremium) return res.redirect('/plans?error='+encodeURIComponent('Google Shortlink is available to Premium users only.'));
+    const allChoices=await getDomainChoices();
+    const domainChoices=getDomainChoicesForUser(freshUser,allChoices);
+    const availableDomains=domainChoices.filter(d=>d.selectable).map(d=>d.domain);
+    const {googleStyleLinks,googleAnalytics}=await getGoogleStyleAnalytics(req.user.id);
+    res.render('index',{page:'google-shortlink',user:freshUser,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),
+      countries,error:req.query.error||null,success:null,info:null,shortUrl:null,customDomains:availableDomains.filter(d=>d!==normalizeHost(BASE_HOST)),
+      availableDomains,domainChoices,baseDomain:BASE_HOST,baseUrl:BASE_URL,googleInput:'',googleConvertedUrl:'',googleShortUrl:'',googleStyleUrl:req.query.googleStyleUrl||'',googleStyleOriginal:req.query.googleStyleOriginal||'',googleStyleDomain:req.query.googleStyleDomain||'',googleStyleCode:req.query.googleStyleCode||'',createdLinkId:req.query.createdLinkId||null,googleStyleLinks,googleAnalytics});
+  }catch(err){console.error('Google shortlink page error:',err);res.redirect('/dashboard?error='+encodeURIComponent('Could not open Google Shortlink tool'));}
+});
+
+app.post('/google-shortlink/convert',authMiddleware,async(req,res)=>{
+  try{
+    const freshUser=await getUserById(req.user.id),active=await getActiveOnlineUsers();
+    if(!freshUser.isPremium) return res.redirect('/plans?error='+encodeURIComponent('Google Shortlink is available to Premium users only.'));
+    const allChoices=await getDomainChoices();
+    const domainChoices=getDomainChoicesForUser(freshUser,allChoices);
+    const availableDomains=domainChoices.filter(d=>d.selectable).map(d=>d.domain);
+    const raw=String(req.body.googleUrl||'').trim();
+    const parsed=parseGoogleShareInput(raw);
+    const {googleStyleLinks,googleAnalytics}=await getGoogleStyleAnalytics(req.user.id);
+    res.render('index',{page:'google-shortlink',user:freshUser,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),
+      countries,error:parsed.error||null,success:parsed.error?null:'Google short link converted successfully.',info:null,shortUrl:null,
+      customDomains:availableDomains.filter(d=>d!==normalizeHost(BASE_HOST)),availableDomains,domainChoices,baseDomain:BASE_HOST,baseUrl:BASE_URL,
+      googleInput:raw,googleConvertedUrl:parsed.convertedUrl||'',googleShortUrl:parsed.shortGoogleUrl||'',googleStyleUrl:'',googleStyleOriginal:'',googleStyleDomain:'',googleStyleCode:'',googleStyleLinks,googleAnalytics});
+  }catch(err){console.error('Google shortlink convert error:',err);res.redirect('/google-shortlink?error='+encodeURIComponent('Conversion failed'));}
+});
+
+
+app.post('/google-shortlink/create-style',authMiddleware,async(req,res)=>{
+  let client;
+  try{
+    const originalUrl=String(req.body.originalUrl||'').trim();
+    const requestedDomain=normalizeHost(req.body.domain||BASE_HOST);
+    const customSlug=String(req.body.customSlug||'').trim();
+
+    if(!originalUrl){
+      return res.redirect('/google-shortlink?error='+encodeURIComponent('Please enter a destination URL.'));
+    }
+    const unsafe=validateDestinationUrl(originalUrl);
+    if(unsafe){
+      return res.redirect('/google-shortlink?error='+encodeURIComponent(unsafe));
+    }
+
+    const enabledDomains=(await getEnabledDomains()).map(normalizeHost);
+    if(!enabledDomains.includes(requestedDomain)){
+      return res.redirect('/google-shortlink?error='+encodeURIComponent('Selected domain is disabled or under maintenance.'));
+    }
+
+    client=await pool.connect();
+    await client.query('BEGIN');
+
+    const userR=await client.query('SELECT * FROM users WHERE id=$1 FOR UPDATE',[req.user.id]);
+    if(!userR.rowCount){
+      await client.query('ROLLBACK');
+      return res.redirect('/login?error='+encodeURIComponent('User account not found'));
+    }
+    const freshUser=mapUser(userR.rows[0]);
+
+    if(!freshUser.isPremium){
+      await client.query('ROLLBACK');
+      return res.redirect('/plans?error='+encodeURIComponent('Google Shortlink is available to Premium users only.'));
+    }
+
+    let shortCode=customSlug;
+    if(shortCode){
+      if(!/^[A-Za-z0-9_-]{2,80}$/.test(shortCode)){
+        await client.query('ROLLBACK');
+        return res.redirect('/google-shortlink?error='+encodeURIComponent('Custom code may use letters, numbers, - and _ only.'));
+      }
+      const ex=await client.query(
+        'SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',
+        [requestedDomain,shortCode]
+      );
+      if(ex.rowCount){
+        await client.query('ROLLBACK');
+        return res.redirect('/google-shortlink?error='+encodeURIComponent('That code is already taken on this domain.'));
+      }
+    }else{
+      for(let i=0;i<20;i++){
+        const candidate=crypto.randomBytes(12).toString('base64url').replace(/[^A-Za-z0-9_-]/g,'').slice(0,18);
+        const ex=await client.query(
+          'SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',
+          [requestedDomain,candidate]
+        );
+        if(!ex.rowCount){shortCode=candidate;break;}
+      }
+      if(!shortCode) throw new Error('Could not generate unique short code');
+    }
+
+    const q=await client.query(
+      `INSERT INTO links(user_id,selected_domain,original_url,short_code,custom_slug,link_type)
+       VALUES($1,$2,$3,$4,$5,'google_style') RETURNING *`,
+      [freshUser.id,requestedDomain,originalUrl,shortCode,customSlug||null]
+    );
+
+    await client.query(
+      'UPDATE users SET total_links=total_links+1 WHERE id=$1',
+      [freshUser.id]
+    );
+
+    await client.query('COMMIT');
+
+    const link=mapLink(q.rows[0]);
+    const googleStyleUrl=buildGoogleStyleShortUrl(link);
+
+    await notifyUser(
+      freshUser.id,
+      'Google Style Shortlink created',
+      `${googleStyleUrl} was created successfully.`,
+      'success'
+    );
+
+    return res.redirect(
+      '/google-shortlink?success='+encodeURIComponent('Google Style Shortlink created!')+
+      '&googleStyleUrl='+encodeURIComponent(googleStyleUrl)+
+      '&googleStyleOriginal='+encodeURIComponent(originalUrl)+
+      '&googleStyleDomain='+encodeURIComponent(requestedDomain)+
+      '&googleStyleCode='+encodeURIComponent(shortCode)+
+      '&createdLinkId='+encodeURIComponent(link.id)
+    );
+  }catch(err){
+    if(client){try{await client.query('ROLLBACK');}catch(_){}}
+    console.error('Google style shortlink error:',err);
+    return res.redirect('/google-shortlink?error='+encodeURIComponent('Could not create Google Style Shortlink: '+err.message));
+  }finally{
+    if(client) client.release();
+  }
+});
+
+// ===== SHORT LINK PAGE =====
+app.get('/shorten-page',authMiddleware,async(req,res)=>{
+  try {
+    const freshUser=await getUserById(req.user.id);
+    const r=await pool.query('SELECT * FROM links WHERE user_id=$1 ORDER BY created_at DESC LIMIT 12',[req.user.id]);
+    const links=r.rows.map(mapLink).map(l=>({...l,shortUrl:l.linkType==='google_style'?buildGoogleStyleShortUrl(l):buildShortUrl(l)})); const active=await getActiveOnlineUsers();
+    const allDomainChoices=await getDomainChoices();
+    const domainChoices=getDomainChoicesForUser(freshUser,allDomainChoices);
+    const enabledDomains=domainChoices.filter(d=>d.selectable).map(d=>d.domain), enabledCustom=enabledDomains.filter(d=>d!==normalizeHost(BASE_HOST));
+    const linkUsage=freshUser.isPremium ? links.length : Number(freshUser.lifetimeLinksCreated || 0);
+    const linksRemaining=freshUser.isPremium ? null : Math.max(0,FREE_LINK_LIMIT-linkUsage);
+    res.render('index',{page:'shorten',user:freshUser,links,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:req.query.shortUrl||null,createdLinkId:req.query.createdLinkId||null,customDomains:enabledCustom,availableDomains:enabledDomains,domainChoices,baseDomain:BASE_HOST,baseUrl:BASE_URL,freeLinkLimit:FREE_LINK_LIMIT,linkUsage,linksRemaining});
+  }catch(e){console.error('Shorten page error:',e);res.redirect('/dashboard?error='+encodeURIComponent('Could not open short link page'));}
+});
+
+app.post('/shorten',authMiddleware,async(req,res)=>{
+  let client;
+  try {
+    const {originalUrl,customSlug,expiresIn,domain,linkPassword}=req.body;
+    const requestedDomain=normalizeHost(domain||BASE_HOST);
+    const enabledDomains=(await getEnabledDomains()).map(normalizeHost);
+    if(!enabledDomains.includes(requestedDomain)){
+      return res.redirect('/shorten-page?error='+encodeURIComponent('Selected domain is currently disabled or under maintenance.'));
+    }
+
+    if(!originalUrl)return res.redirect('/shorten-page?error='+encodeURIComponent('Please enter a URL'));
+    const unsafe=validateDestinationUrl(originalUrl);
+    if(unsafe)return res.redirect('/shorten-page?error='+encodeURIComponent(unsafe));
+
+    client=await pool.connect();
+    await client.query('BEGIN');
+
+    const userR=await client.query('SELECT * FROM users WHERE id=$1 FOR UPDATE',[req.user.id]);
+    if(!userR.rowCount){
+      await client.query('ROLLBACK');
+      return res.redirect('/login?error='+encodeURIComponent('User account not found'));
+    }
+    const freshUser=mapUser(userR.rows[0]);
+
+    if(!freshUser.isPremium){
+      if(!FREE_PLAN_DOMAINS.has(requestedDomain)){
+        await client.query('ROLLBACK');
+        return res.redirect('/plans?error='+encodeURIComponent('This domain is Premium-only. Free users can use only the .world domain.'));
+      }
+      if(Number(freshUser.lifetimeLinksCreated||0) >= FREE_LINK_LIMIT){
+        await client.query('ROLLBACK');
+        return res.redirect('/plans?error='+encodeURIComponent(`Free lifetime limit reached (${FREE_LINK_LIMIT}/${FREE_LINK_LIMIT}). Deleting links does not restore quota. Upgrade to Premium for unlimited links.`));
+      }
+    }
+
+    let shortCode=String(customSlug||'').trim();
+    if(shortCode){
+      if(!/^[A-Za-z0-9_-]{2,80}$/.test(shortCode)){
+        await client.query('ROLLBACK');
+        return res.redirect('/shorten-page?error='+encodeURIComponent('Custom slug may use letters, numbers, - and _ only'));
+      }
+      const ex=await client.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[requestedDomain,shortCode]);
+      if(ex.rowCount){
+        await client.query('ROLLBACK');
+        return res.redirect('/shorten-page?error='+encodeURIComponent('Custom slug already taken on this domain'));
+      }
+    } else {
+      for(let i=0;i<12;i++){
+        const c=generateShortCode();
+        const ex=await client.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[requestedDomain,c]);
+        if(!ex.rowCount){shortCode=c;break;}
+      }
+      if(!shortCode)throw new Error('Could not generate unique short code');
+    }
+
+    let expiresAt=null;
+    if(expiresIn){
+      const days=parseInt(expiresIn);
+      if(!isNaN(days))expiresAt=new Date(Date.now()+days*86400000);
+    }
+
+    const passwordEnabled=!!String(linkPassword||'').trim();
+    if(passwordEnabled && !freshUser.isPremium){
+      await client.query('ROLLBACK');
+      return res.redirect('/plans?error='+encodeURIComponent('Password-protected links are a Premium feature.'));
+    }
+    const passwordHash=passwordEnabled?hashLinkPassword(linkPassword):null;
+
+    const q=await client.query(`INSERT INTO links(user_id,selected_domain,original_url,short_code,custom_slug,expires_at,password_hash,password_enabled)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.user.id,requestedDomain,originalUrl,shortCode,customSlug||null,expiresAt,passwordHash,passwordEnabled]);
+
+    await client.query(
+      'UPDATE users SET total_links=total_links+1,lifetime_links_created=lifetime_links_created+1 WHERE id=$1',
+      [req.user.id]
+    );
+
+    await client.query('COMMIT');
+
+    const link=mapLink(q.rows[0]);
+    const shortUrl=buildShortUrl(link);
+    await notifyUser(req.user.id,'Short link created',`${shortUrl} was created successfully.`,'success');
+    res.redirect('/shorten-page?success='+encodeURIComponent('Link created successfully!')+'&shortUrl='+encodeURIComponent(shortUrl)+'&createdLinkId='+encodeURIComponent(link.id));
+  }catch(e){
+    if(client){try{await client.query('ROLLBACK');}catch(_){}}
+    console.error('Shorten error:',e);
+    res.redirect('/shorten-page?error='+encodeURIComponent('Failed to create short link: '+e.message));
+  }finally{
+    if(client)client.release();
+  }
+});
+
+// ===== QR =====
+app.get('/qr/:code',async(req,res)=>{
+  try {
+    const code=String(req.params.code||'').trim();
+    const requestedDomain=req.query.domain ? normalizeHost(req.query.domain) : '';
+
+    let q;
+    if(requestedDomain){
+      q=await pool.query(
+        'SELECT * FROM links WHERE LOWER(selected_domain)=LOWER($1) AND short_code=$2 ORDER BY id DESC LIMIT 1',
+        [requestedDomain,code]
+      );
+    }else{
+      // Backward compatibility: only use a code-only result when it resolves to one link.
+      q=await pool.query(
+        'SELECT * FROM links WHERE short_code=$1 ORDER BY id DESC LIMIT 2',
+        [code]
+      );
+      if(q.rowCount>1){
+        return res.status(400).json({error:'Domain is required for this QR code'});
+      }
+    }
+
+    if(!q.rowCount)return res.status(404).json({error:'Short link not found for the selected domain'});
+
+    const link=mapLink(q.rows[0]);
+    const exactDomain=normalizeHost(link.selectedDomain||link.selected_domain||requestedDomain||BASE_HOST);
+    const url=`https://${exactDomain}/${encodeURIComponent(link.shortCode||code)}`;
+
+    const qr=await QRCode.toDataURL(url,{
+      errorCorrectionLevel:'H',
+      margin:3,
+      scale:10,
+      width:420,
+      color:{dark:'#000000',light:'#FFFFFF'}
+    });
+
+    res.set('Cache-Control','no-store');
+    res.json({qr,url,domain:exactDomain,shortCode:link.shortCode||code});
+  }catch(e){
+    console.error('QR error:',e);
+    res.status(500).json({error:'Failed to generate QR code'});
+  }
+});
+
+// ===== LINK MANAGEMENT =====
+
+// ===== V7.11 CANONICAL USER LINK ACTIONS =====
+// These routes match the My Links forms exactly.
+// Free/Premium plan does NOT affect editing an already-created link.
+app.post('/links/:id/update',authMiddleware,async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    const newUrl=String(req.body.originalUrl||req.body.newUrl||'').trim();
+    if(!Number.isFinite(id)||id<=0)return res.redirect('/my-links?error='+encodeURIComponent('Invalid link ID'));
+    if(!newUrl)return res.redirect('/my-links?error='+encodeURIComponent('Please enter a destination URL'));
+
+    const unsafe=validateDestinationUrl(newUrl);
+    if(unsafe)return res.redirect('/my-links?error='+encodeURIComponent(unsafe));
+
+    const q=await pool.query(
+      'UPDATE links SET original_url=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3 RETURNING id',
+      [newUrl,id,req.user.id]
+    );
+    if(!q.rowCount)return res.redirect('/my-links?error='+encodeURIComponent('Link not found or you do not own this link'));
+
+    await notifyUser(req.user.id,'Short link updated','Your destination URL was updated successfully.','success');
+    res.redirect('/my-links?success='+encodeURIComponent('Link updated successfully!'));
+  }catch(e){
+    console.error('User link update error:',e);
+    res.redirect('/my-links?error='+encodeURIComponent('Failed to update link'));
+  }
+});
+
+app.post('/links/:id/auto-update',authMiddleware,async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    const nextUrl=String(req.body.autoUpdateUrl||'').trim();
+    const threshold=Number.parseInt(req.body.autoUpdateThreshold,10);
+    const returnTo=String(req.body.returnTo||'/my-links');
+    const safeReturn=['/my-links','/dashboard'].includes(returnTo)?returnTo:(`/links/${id}/stats`);
+    if(!Number.isFinite(id)||id<=0)return res.redirect(safeReturn+'?error='+encodeURIComponent('Invalid link ID'));
+    if(!nextUrl)return res.redirect(safeReturn+'?error='+encodeURIComponent('Please enter the automatic update URL'));
+    const unsafe=validateDestinationUrl(nextUrl);
+    if(unsafe)return res.redirect(safeReturn+'?error='+encodeURIComponent(unsafe));
+    if(!Number.isInteger(threshold)||threshold<1||threshold>1000000)return res.redirect(safeReturn+'?error='+encodeURIComponent('Switch-after clicks must be between 1 and 1,000,000'));
+    const q=await pool.query(`UPDATE links SET auto_update_url=$1,auto_update_threshold=$2,auto_update_enabled=TRUE,
+      auto_update_start_clicks=clicks,auto_update_switched_at=NULL,updated_at=NOW()
+      WHERE id=$3 AND user_id=$4 RETURNING id`,[nextUrl,threshold,id,req.user.id]);
+    if(!q.rowCount)return res.redirect(safeReturn+'?error='+encodeURIComponent('Link not found or you do not own this link'));
+    await notifyUser(req.user.id,'Automatic link update enabled',`Destination will switch automatically after ${threshold} new real clicks.`,'success');
+    res.redirect(safeReturn+'?success='+encodeURIComponent(`Automatic update enabled: switch after ${threshold} new real clicks.`));
+  }catch(e){console.error('Auto update setup error:',e);res.redirect('/my-links?error='+encodeURIComponent('Failed to configure automatic update'));}
+});
+app.post('/links/:id/auto-update/disable',authMiddleware,async(req,res)=>{
+  try{
+    const id=Number(req.params.id),returnTo=String(req.body.returnTo||'/my-links');
+    const safeReturn=['/my-links','/dashboard'].includes(returnTo)?returnTo:(`/links/${id}/stats`);
+    const q=await pool.query(`UPDATE links SET auto_update_enabled=FALSE,updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING id`,[id,req.user.id]);
+    if(!q.rowCount)return res.redirect(safeReturn+'?error='+encodeURIComponent('Link not found'));
+    res.redirect(safeReturn+'?success='+encodeURIComponent('Automatic link update disabled.'));
+  }catch(e){res.redirect('/my-links?error='+encodeURIComponent('Failed to disable automatic update'));}
+});
+
+app.post('/links/:id/toggle',authMiddleware,async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    const q=await pool.query(
+      'UPDATE links SET is_active=NOT is_active,updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING id,is_active',
+      [id,req.user.id]
+    );
+    if(!q.rowCount)return res.redirect('/my-links?error='+encodeURIComponent('Link not found or you do not own this link'));
+    res.redirect('/my-links?success='+encodeURIComponent(q.rows[0].is_active?'Link enabled successfully!':'Link disabled successfully!'));
+  }catch(e){
+    console.error('User link toggle error:',e);
+    res.redirect('/my-links?error='+encodeURIComponent('Failed to change link status'));
+  }
+});
+
+app.post('/links/:id/delete',authMiddleware,async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    const q=await pool.query(
+      'DELETE FROM links WHERE id=$1 AND user_id=$2 RETURNING id',
+      [id,req.user.id]
+    );
+    if(!q.rowCount)return res.redirect('/my-links?error='+encodeURIComponent('Link not found or you do not own this link'));
+    await pool.query('UPDATE users SET total_links=GREATEST(total_links-1,0) WHERE id=$1',[req.user.id]);
+    res.redirect('/my-links?success='+encodeURIComponent('Link deleted successfully!'));
+  }catch(e){
+    console.error('User link delete error:',e);
+    res.redirect('/my-links?error='+encodeURIComponent('Failed to delete link'));
+  }
+});
+
+app.post('/update-link/:id',authMiddleware,async(req,res)=>{
+  try{
+    const newUrl=String(req.body.newUrl||req.body.originalUrl||'').trim();
+    if(!newUrl)return res.redirect('/dashboard?error='+encodeURIComponent('Please enter a URL'));
+    const unsafe=validateDestinationUrl(newUrl);
+    if(unsafe)return res.redirect('/dashboard?error='+encodeURIComponent(unsafe));
+    const q=await pool.query('UPDATE links SET original_url=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3 RETURNING id',[newUrl,Number(req.params.id),req.user.id]);
+    if(!q.rowCount)return res.redirect('/dashboard?error='+encodeURIComponent('Link not found'));
+    res.redirect('/dashboard?success='+encodeURIComponent('Link updated successfully!'));
+  }catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Failed to update link'));}
+});
+app.post('/toggle-link/:id',authMiddleware,async(req,res)=>{
+  try{const q=await pool.query('UPDATE links SET is_active=NOT is_active,updated_at=NOW() WHERE id=$1 AND user_id=$2 RETURNING id',[Number(req.params.id),req.user.id]);if(!q.rowCount)return res.redirect('/dashboard?error='+encodeURIComponent('Link not found'));res.redirect('/dashboard?success='+encodeURIComponent('Link toggled successfully!'));}catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Failed to toggle link'));}
+});
+app.post('/delete-link/:id',authMiddleware,async(req,res)=>{
+  try{const q=await pool.query('DELETE FROM links WHERE id=$1 AND user_id=$2 RETURNING id',[Number(req.params.id),req.user.id]);if(!q.rowCount)return res.redirect('/dashboard?error='+encodeURIComponent('Link not found'));await pool.query('UPDATE users SET total_links=GREATEST(total_links-1,0) WHERE id=$1',[req.user.id]);res.redirect('/dashboard?success='+encodeURIComponent('Link deleted successfully!'));}catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Failed to delete link'));}
+});
+
+// ===== USER APIs =====
+app.get('/api/user-data',authMiddleware,async(req,res)=>{
+  try{const user=await getUserById(req.user.id);const [lr,cr]=await Promise.all([pool.query('SELECT COUNT(*)::int AS count FROM links WHERE user_id=$1',[user.id]),pool.query('SELECT COUNT(*)::int AS count FROM clicks WHERE user_id=$1 AND is_bot=FALSE',[user.id])]);const fields=['displayName','email','username','firstName','lastName'];const filled=fields.filter(f=>user[f]).length;res.json({...user,totalLinks:Number(lr.rows[0].count),totalClicks:Number(cr.rows[0].count),completion:Math.round(filled/fields.length*100)});}catch(e){res.status(500).json({error:'Failed to load user data'});}
+});
+app.post('/api/update-profile',authMiddleware,async(req,res)=>{
+  try{const current=await getUserById(req.user.id);const first=req.body.firstName!==undefined?String(req.body.firstName):current.firstName,last=req.body.lastName!==undefined?String(req.body.lastName):current.lastName,display=req.body.displayName!==undefined?String(req.body.displayName):(first+(last?' '+last:'')),email=req.body.email!==undefined?String(req.body.email):current.email,photo=req.body.profilePhoto!==undefined?String(req.body.profilePhoto):current.profilePhoto,tz=req.body.timezone!==undefined?String(req.body.timezone):current.timezone;const q=await pool.query('UPDATE users SET first_name=$1,last_name=$2,display_name=$3,email=$4,profile_photo=$5,timezone=$6 WHERE id=$7 RETURNING *',[first,last,display,email,photo,tz,current.id]);const user=mapUser(q.rows[0]);await markOnline(user);Object.assign(req.session.user,{displayName:user.displayName,firstName:user.firstName,email:user.email,profilePhoto:user.profilePhoto,timezone:user.timezone});res.json({success:true,user});}catch(e){res.status(500).json({error:'Failed to update profile'});}
+});
+app.post('/api/update-timezone',authMiddleware,async(req,res)=>{
+  try{if(!req.body.timezone)return res.status(400).json({error:'Timezone is required'});await pool.query('UPDATE users SET timezone=$1 WHERE id=$2',[String(req.body.timezone),req.user.id]);req.session.user.timezone=String(req.body.timezone);res.json({success:true,timezone:req.body.timezone});}catch(e){res.status(500).json({error:'Failed to update timezone'});}
+});
+app.get('/api/online-users',async(req,res)=>{try{const a=await getActiveOnlineUsers();res.json({count:a.length,users:a.map(u=>({name:u.displayName||u.username||'User'}))});}catch(e){res.json({count:0,users:[]});}});
+
+
+// ===== PREMIUM API KEY =====
+app.get('/api-access', authMiddleware, async(req,res)=>{
+  try{
+    const user=await getUserById(req.user.id), active=await getActiveOnlineUsers();
+    res.render('index',{page:'api-access',user,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,
+      error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,
+      customDomains:(await getEnabledDomains()).filter(d=>d!==normalizeHost(BASE_HOST)),availableDomains:await getEnabledDomains(),baseDomain:BASE_HOST,baseUrl:BASE_URL,
+      generatedApiKey:req.session.generatedApiKey||null});
+    delete req.session.generatedApiKey;
+  }catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Could not open API access page'));}
+});
+app.post('/api-access/generate', authMiddleware, async(req,res)=>{
+  try{
+    const user=await getUserById(req.user.id);
+    if(!user.isPremium)return res.redirect('/plans?error='+encodeURIComponent('API access is available to Premium users only.'));
+    if(!user.apiAdminEnabled)return res.redirect('/api-access?error='+encodeURIComponent('API access is disabled by administrator. Contact admin to enable it.'));
+    const key=makeApiKey(),hash=sha256(key),prefix=key.slice(0,18);
+    await pool.query('UPDATE users SET api_key_hash=$1,api_key_prefix=$2,api_key_created_at=NOW(),api_enabled=TRUE WHERE id=$3',[hash,prefix,user.id]);
+    req.session.generatedApiKey=key;
+    await notifyUser(user.id,'API key generated','A new Premium API key was generated. Store it safely; it is shown only once.','success');
+    req.session.save(()=>res.redirect('/api-access?success='+encodeURIComponent('New API key generated. Copy it now — it will not be shown again.')));
+  }catch(e){res.redirect('/api-access?error='+encodeURIComponent('Could not generate API key'));}
+});
+app.post('/api-access/revoke', authMiddleware, async(req,res)=>{
+  try{
+    await pool.query("UPDATE users SET api_key_hash=NULL,api_key_prefix='',api_key_created_at=NULL,api_enabled=FALSE WHERE id=$1",[req.user.id]);
+    await notifyUser(req.user.id,'API key revoked','Your API key has been revoked.','info');
+    res.redirect('/api-access?success='+encodeURIComponent('API key revoked'));
+  }catch(e){res.redirect('/api-access?error='+encodeURIComponent('Could not revoke API key'));}
+});
+
+app.post('/api-access/toggle', authMiddleware, async(req,res)=>{
+  try{
+    const user=await getUserById(req.user.id);
+    if(!user.isPremium)return res.redirect('/plans?error='+encodeURIComponent('API access is available to Premium users only.'));
+
+    const next=String(req.body.enabled||'').toLowerCase()==='true';
+
+    if(next){
+      if(!user.apiAdminEnabled){
+        return res.redirect('/api-access?error='+encodeURIComponent('API access is disabled by administrator. Contact admin to enable it.'));
+      }
+      if(!user.apiKeyPrefix){
+        return res.redirect('/api-access?error='+encodeURIComponent('Generate an API key first, then turn API access ON.'));
+      }
+    }
+
+    await pool.query('UPDATE users SET api_enabled=$1 WHERE id=$2',[next,user.id]);
+    await notifyUser(
+      user.id,
+      'API access updated',
+      next ? 'Your API access is now ON.' : 'Your API access is now OFF. Existing API key requests will be rejected until you turn it back on.',
+      next ? 'success' : 'info'
+    );
+    res.redirect('/api-access?success='+encodeURIComponent(next?'API access turned ON':'API access turned OFF'));
+  }catch(e){
+    console.error('API user toggle error:',e);
+    res.redirect('/api-access?error='+encodeURIComponent('Could not update API access'));
+  }
+});
+
+
+// Premium REST API
+app.post('/api/v1/shorten', authenticateApiKey, async(req,res)=>{
+  try{
+    const user=req.apiUser;
+    const originalUrl=String(req.body.url||req.body.originalUrl||'').trim();
+    const customSlug=String(req.body.customSlug||'').trim();
+    const requestedDomain=normalizeHost(req.body.domain||BASE_HOST);
+    const enabled=await getEnabledDomains();
+    if(!enabled.includes(requestedDomain))return res.status(400).json({error:'Domain is unavailable or disabled'});
+    const unsafe=validateDestinationUrl(originalUrl); if(unsafe)return res.status(400).json({error:unsafe});
+    let shortCode=customSlug;
+    if(shortCode){
+      if(!/^[A-Za-z0-9_-]{2,80}$/.test(shortCode))return res.status(400).json({error:'Invalid customSlug'});
+      const ex=await pool.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[requestedDomain,shortCode]);
+      if(ex.rowCount)return res.status(409).json({error:'customSlug already exists on this domain'});
+    } else {
+      for(let i=0;i<12;i++){const c=generateShortCode();const ex=await pool.query('SELECT 1 FROM links WHERE selected_domain=$1 AND short_code=$2',[requestedDomain,c]);if(!ex.rowCount){shortCode=c;break;}}
+    }
+    let expiresAt=null; const days=Number(req.body.expiresIn||0); if(days>0)expiresAt=new Date(Date.now()+days*86400000);
+    const password=String(req.body.password||'').trim();
+    const q=await pool.query(`INSERT INTO links(user_id,selected_domain,original_url,short_code,custom_slug,expires_at,password_hash,password_enabled)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [user.id,requestedDomain,originalUrl,shortCode,customSlug||null,expiresAt,password?hashLinkPassword(password):null,!!password]);
+    await pool.query('UPDATE users SET total_links=total_links+1,lifetime_links_created=lifetime_links_created+1 WHERE id=$1',[user.id]);
+    const link=mapLink(q.rows[0]),shortUrl=buildShortUrl(link);
+    res.status(201).json({success:true,id:link.id,shortUrl,domain:link.selectedDomain,shortCode:link.shortCode,expiresAt:link.expiresAt,passwordProtected:link.passwordEnabled});
+  }catch(e){console.error('API shorten error:',e);res.status(500).json({error:'Could not create short link'});}
+});
+// ===== V7.17 BOT/API DOMAIN SYNC + LINK EDIT =====
+app.get('/api/v1/domains', authenticateApiKey, async(req,res)=>{
+  try{
+    const domains=await getDomainChoices();
+    res.json({baseDomain:normalizeHost(BASE_HOST),domains:domains.map(d=>({domain:d.domain,enabled:!!d.enabled,maintenance:!!d.maintenance,selectable:!!d.selectable,health:d.lastHealth||'unknown'}))});
+  }catch(e){console.error('API domains error:',e);res.status(500).json({error:'Could not load domains'});}
+});
+
+app.patch('/api/v1/links/:id', authenticateApiKey, async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    if(!Number.isInteger(id)||id<=0)return res.status(400).json({error:'Invalid link ID'});
+    const originalUrl=String(req.body.url||req.body.originalUrl||'').trim();
+    if(!originalUrl)return res.status(400).json({error:'Destination URL is required'});
+    const unsafe=validateDestinationUrl(originalUrl);if(unsafe)return res.status(400).json({error:unsafe});
+    const q=await pool.query(`UPDATE links SET original_url=$1,updated_at=NOW() WHERE id=$2 AND user_id=$3 RETURNING *`,[originalUrl,id,req.apiUser.id]);
+    if(!q.rowCount)return res.status(404).json({error:'Link not found or not owned by this API account'});
+    const link=mapLink(q.rows[0]);
+    res.json({success:true,id:link.id,shortUrl:buildShortUrl(link),originalUrl:link.originalUrl,domain:link.selectedDomain,shortCode:link.shortCode,updatedAt:link.updatedAt});
+  }catch(e){console.error('API link edit error:',e);res.status(500).json({error:'Could not update short link'});}
+});
+
+app.get('/api/v1/links', authenticateApiKey, async(req,res)=>{
+  try{
+    const q=await pool.query('SELECT * FROM links WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100',[req.apiUser.id]);
+    res.json({links:q.rows.map(mapLink).map(l=>({...l,shortUrl:buildShortUrl(l)}))});
+  }catch(e){res.status(500).json({error:'Could not load links'});}
+});
+app.get('/api/v1/stats', authenticateApiKey, async(req,res)=>{
+  try{
+    const q=await pool.query(`SELECT COUNT(*) FILTER (WHERE is_bot=FALSE)::bigint AS real_clicks,
+      COUNT(*) FILTER (WHERE is_bot=TRUE)::bigint AS bot_clicks,
+      COUNT(DISTINCT NULLIF(ip_address,'')) FILTER (WHERE is_bot=FALSE)::bigint AS unique_visitors
+      FROM clicks WHERE user_id=$1`,[req.apiUser.id]);
+    const l=await pool.query('SELECT COUNT(*)::bigint AS links FROM links WHERE user_id=$1',[req.apiUser.id]);
+    res.json({links:Number(l.rows[0].links),realClicks:Number(q.rows[0].real_clicks),botClicks:Number(q.rows[0].bot_clicks),uniqueVisitors:Number(q.rows[0].unique_visitors)});
+  }catch(e){res.status(500).json({error:'Could not load stats'});}
+});
+
+// ===== NOTIFICATIONS =====
+app.get('/notifications', authMiddleware, async(req,res)=>{
+  try{
+    const active=await getActiveOnlineUsers();
+    const q=await pool.query('SELECT * FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100',[req.user.id]);
+    res.render('index',{page:'notifications',user:await getUserById(req.user.id),notifications:q.rows,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,
+      error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,
+      customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+  }catch(e){res.redirect('/dashboard?error='+encodeURIComponent('Could not load notifications'));}
+});
+app.post('/notifications/read-all', authMiddleware, async(req,res)=>{
+  await pool.query('UPDATE notifications SET is_read=TRUE WHERE user_id=$1',[req.user.id]);
+  res.redirect('/notifications?success='+encodeURIComponent('Notifications marked as read'));
+});
+
+// ===== LEGAL / FAQ =====
+app.get('/faq', async(req,res)=>renderStaticPage(req,res,'faq'));
+app.get('/privacy', async(req,res)=>renderStaticPage(req,res,'privacy'));
+app.get('/terms', async(req,res)=>renderStaticPage(req,res,'terms'));
+async function renderStaticPage(req,res,page){
+  try{
+    const active=await getActiveOnlineUsers();
+    const user=req.session?.user?.id?await getUserById(req.session.user.id):null;
+    res.render('index',{page,user,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,error:null,success:null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+  }catch(e){res.status(500).send('Page error');}
+}
+
+
+
+// ===== REDEEM CODE =====
+app.get('/redeem',authMiddleware,async(req,res)=>{
+  try{
+    const freshUser=await getUserById(req.user.id);
+    const active=await getActiveOnlineUsers();
+    const history=await pool.query(`SELECT r.code,r.premium_days,u.redeemed_at FROM redeem_code_uses u JOIN redeem_codes r ON r.id=u.redeem_code_id WHERE u.user_id=$1 ORDER BY u.redeemed_at DESC LIMIT 20`,[req.user.id]);
+    res.render('index',{page:'redeem',user:freshUser,redeemHistory:history.rows,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+  }catch(e){console.error('Redeem page error:',e);res.redirect('/dashboard?error='+encodeURIComponent('Could not load redeem page'));}
+});
+
+app.post('/redeem',authMiddleware,async(req,res)=>{
+  const code=String(req.body.code||'').trim().toUpperCase().replace(/\s+/g,'');
+  if(!code) return res.redirect('/redeem?error='+encodeURIComponent('Enter a redeem code'));
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const codeR=await client.query('SELECT * FROM redeem_codes WHERE UPPER(code)=UPPER($1) FOR UPDATE',[code]);
+    if(!codeR.rowCount) throw new Error('INVALID_CODE');
+    const redeem=codeR.rows[0];
+    if(!redeem.is_active) throw new Error('CODE_DISABLED');
+    const used=await client.query('SELECT 1 FROM redeem_code_uses WHERE redeem_code_id=$1 AND user_id=$2 LIMIT 1',[redeem.id,req.user.id]);
+    if(used.rowCount) throw new Error('ALREADY_USED');
+    const countR=await client.query('SELECT COUNT(*)::int AS count FROM redeem_code_uses WHERE redeem_code_id=$1',[redeem.id]);
+    if(Number(countR.rows[0].count)>=Number(redeem.max_uses)) throw new Error('CODE_FULL');
+    await client.query(`UPDATE users SET plan_type='premium',premium_until=GREATEST(COALESCE(premium_until,NOW()),NOW()) + ($1 || ' days')::interval WHERE id=$2`,[Number(redeem.premium_days),req.user.id]);
+    await client.query('INSERT INTO redeem_code_uses(redeem_code_id,user_id) VALUES($1,$2)',[redeem.id,req.user.id]);
+    await client.query('COMMIT');
+    await notifyUser(req.user.id,'Redeem successful',`Your Premium plan was extended by ${Number(redeem.premium_days)} day(s).`,'success');
+    res.redirect('/redeem?success='+encodeURIComponent(`Redeemed successfully! Premium added for ${Number(redeem.premium_days)} day(s).`));
+  }catch(e){
+    try{await client.query('ROLLBACK');}catch(_){}
+    const msg={INVALID_CODE:'Invalid redeem code.',CODE_DISABLED:'This redeem code is disabled.',ALREADY_USED:'You already used this redeem code.',CODE_FULL:'This redeem code has reached its maximum user limit.'}[e.message]||'Redeem failed. Please try again.';
+    res.redirect('/redeem?error='+encodeURIComponent(msg));
+  }finally{client.release();}
+});
+
+// ===== PLANS / MANUAL PAYMENT =====
+app.get('/plans', authMiddleware, async (req,res)=>{
+  try {
+    const active = await getActiveOnlineUsers();
+    const payments = await pool.query('SELECT id,plan_months,amount,method,transaction_id,status,admin_note,created_at,reviewed_at FROM payments WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20',[req.user.id]);
+    const user = await getUserById(req.user.id);
+    const pay = paymentConfig();
+    res.render('index',{
+      page:'plans',user,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),
+      countries,error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,
+      customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL,
+      freeLinkLimit:FREE_LINK_LIMIT,plan1Price:PLAN_1_PRICE,plan3Price:PLAN_3_PRICE,plan12Price:PLAN_12_PRICE,plan1Usd:PLAN_1_USD,plan3Usd:PLAN_3_USD,plan12Usd:PLAN_12_USD,
+      bkashNumber:pay.bkashNumber,nagadNumber:pay.nagadNumber,binanceId:pay.binanceId,
+      bkashConfigured:pay.bkashConfigured,nagadConfigured:pay.nagadConfigured,binanceConfigured:pay.binanceConfigured,
+      paymentHistory:payments.rows
+    });
+  } catch(e){ console.error('Plans page error:',e); res.redirect('/dashboard?error='+encodeURIComponent('Could not load plans')); }
+});
+
+app.get('/api/payment-config-status', authMiddleware, async(req,res)=>{
+  try{
+    const p=paymentConfig();
+    res.json({bkash:p.bkashConfigured?'SET':'MISSING',nagad:p.nagadConfigured?'SET':'MISSING',binance:p.binanceConfigured?'SET':'MISSING'});
+  }catch(e){res.status(500).json({error:'Could not read payment configuration'});}
+});
+
+app.post('/payments', authMiddleware, paymentUpload.single('screenshot'), async (req,res)=>{
+  try {
+    const months = Number(req.body.planMonths);
+    if (![1,3,12].includes(months)) return res.redirect('/plans?error='+encodeURIComponent('Invalid plan'));
+    const method = String(req.body.method||'').toLowerCase();
+    if (!['bkash','nagad','binance'].includes(method)) return res.redirect('/plans?error='+encodeURIComponent('Choose bKash, Nagad or Binance'));
+
+    // bKash/Nagad use Transaction ID. Binance uses Order ID in the same secure reference field.
+    const txn = String(req.body.transactionId||req.body.orderId||'').trim();
+    const refName = method === 'binance' ? 'Binance Order ID' : 'transaction ID';
+    if (txn.length < 4) return res.redirect('/plans?error='+encodeURIComponent('Enter a valid '+refName));
+    if (!req.file) return res.redirect('/plans?error='+encodeURIComponent('Upload payment screenshot'));
+
+    const amount = expectedPlanAmount(months);
+    await pool.query(`INSERT INTO payments(user_id,plan_months,amount,method,transaction_id,screenshot,screenshot_mime)
+      VALUES($1,$2,$3,$4,$5,$6,$7)`,[req.user.id,months,amount,method,txn,req.file.buffer,req.file.mimetype]);
+
+    await notifyUser(req.user.id,'Payment submitted',
+      method==='binance' ? 'Your Binance payment proof and Order ID are pending admin review.' : 'Your Send Money payment is pending admin review.',
+      'info');
+
+    res.redirect('/plans?success='+encodeURIComponent('Payment submitted. Admin will review it.'));
+  } catch(e){
+    const msg = e.code === '23505' ? 'This transaction/order ID was already submitted.' : ('Payment submission failed: '+e.message);
+    res.redirect('/plans?error='+encodeURIComponent(msg));
+  }
+});
+
+// ===== ADMIN =====
+app.get('/admin/login', async (req,res)=>{
+  if (await getAdminState(req)) return res.redirect('/admin');
+  let active=[]; try{active=await getActiveOnlineUsers();}catch(e){}
+  res.render('index',{page:'admin-login',user:null,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,
+    error:req.query.error||null,success:null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL});
+});
+app.post('/admin/login', async (req,res)=>{
+  const email=String(req.body.email||'').trim().toLowerCase(), password=String(req.body.password||'');
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return res.redirect('/admin/login?error='+encodeURIComponent('ADMIN_EMAIL / ADMIN_PASSWORD are not configured in Railway Variables.'));
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) return res.redirect('/admin/login?error='+encodeURIComponent('Invalid admin credentials'));
+  req.session.admin=true;
+  return req.session.save(()=>res.redirect('/admin'));
+});
+app.post('/admin/logout', (req,res)=>{ delete req.session.admin; req.session.save(()=>res.redirect('/admin/login')); });
+
+
+app.post('/admin/redeem-codes/create',adminMiddleware,async(req,res)=>{
+  try{
+    let code=String(req.body.code||'').trim().toUpperCase().replace(/[^A-Z0-9_-]/g,'');
+    const premiumDays=Math.max(1,Math.min(3650,Number(req.body.premiumDays||30)));
+    const maxUses=Math.max(1,Math.min(100000,Number(req.body.maxUses||1)));
+    if(!code) code='TPIB-'+crypto.randomBytes(5).toString('hex').toUpperCase();
+    if(code.length<4 || code.length>64) return res.redirect('/admin?error='+encodeURIComponent('Redeem code must be 4-64 characters.'));
+    await pool.query('INSERT INTO redeem_codes(code,premium_days,max_uses,created_by) VALUES($1,$2,$3,$4)',[code,premiumDays,maxUses,ADMIN_EMAIL||'admin']);
+    await auditAdmin(req,'redeem_code_create','redeem_code',code,`premium_days=${premiumDays};max_uses=${maxUses}`);
+    res.redirect('/admin?success='+encodeURIComponent(`Redeem code created: ${code}`));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent(e.code==='23505'?'That redeem code already exists.':'Could not create redeem code.'));}
+});
+app.post('/admin/redeem-codes/:id/toggle',adminMiddleware,async(req,res)=>{
+  try{const id=Number(req.params.id);const q=await pool.query('UPDATE redeem_codes SET is_active=NOT is_active WHERE id=$1 RETURNING code,is_active',[id]);if(!q.rowCount)return res.redirect('/admin?error='+encodeURIComponent('Redeem code not found'));await auditAdmin(req,'redeem_code_toggle','redeem_code',id,`active=${q.rows[0].is_active}`);res.redirect('/admin?success='+encodeURIComponent(q.rows[0].is_active?'Redeem code enabled':'Redeem code disabled'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update redeem code'));}
+});
+app.post('/admin/redeem-codes/:id/delete',adminMiddleware,async(req,res)=>{
+  try{const id=Number(req.params.id);const q=await pool.query('DELETE FROM redeem_codes WHERE id=$1 RETURNING code',[id]);if(!q.rowCount)return res.redirect('/admin?error='+encodeURIComponent('Redeem code not found'));await auditAdmin(req,'redeem_code_delete','redeem_code',id,`code=${q.rows[0].code}`);res.redirect('/admin?success='+encodeURIComponent('Redeem code deleted'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not delete redeem code'));}
+});
+
+app.post('/admin/site-maintenance/settings',adminMiddleware,async(req,res)=>{
+  try{
+    const message=String(req.body.maintenanceMessage||'').trim().slice(0,500);
+    const eta=String(req.body.maintenanceEta||'').trim().slice(0,160);
+
+    const resumeMode=String(req.body.resumeMode||'manual').trim();
+    const resumePreset=String(req.body.resumePreset||'').trim();
+    const customMinutes=Math.max(0,Number(req.body.customMinutes||0));
+    const exactLocal=String(req.body.maintenanceUntil||'').trim();
+    const offsetMinutes=Number(req.body.timezoneOffset||0);
+
+    let untilIso='';
+
+    // Preferred timezone-safe mode: NOW + duration.
+    if(resumeMode==='duration'){
+      let minutes=0;
+
+      const presetMap={
+        '30m':30,
+        '1h':60,
+        '2h':120,
+        '6h':360,
+        '12h':720,
+        '24h':1440
+      };
+
+      if(resumePreset==='custom'){
+        minutes=Math.floor(customMinutes);
+      }else{
+        minutes=presetMap[resumePreset]||0;
+      }
+
+      if(minutes<1 || minutes>10080){
+        return res.redirect('/admin?error='+encodeURIComponent('Choose a valid auto-resume duration between 1 minute and 7 days.'));
+      }
+
+      untilIso=new Date(Date.now() + minutes*60000).toISOString();
+    }
+
+    // Optional exact local date/time mode.
+    if(resumeMode==='exact'){
+      if(!exactLocal){
+        return res.redirect('/admin?error='+encodeURIComponent('Choose an exact auto-resume date/time.'));
+      }
+
+      const m=exactLocal.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if(!m){
+        return res.redirect('/admin?error='+encodeURIComponent('Invalid exact auto-resume date/time.'));
+      }
+
+      const localAsUtc=Date.UTC(
+        Number(m[1]),Number(m[2])-1,Number(m[3]),
+        Number(m[4]),Number(m[5]),Number(m[6]||0)
+      );
+
+      const utcMs=localAsUtc + (Number.isFinite(offsetMinutes)?offsetMinutes:0)*60000;
+
+      if(utcMs<=Date.now()+5000){
+        return res.redirect('/admin?error='+encodeURIComponent('Auto-resume time must be in the future.'));
+      }
+
+      untilIso=new Date(utcMs).toISOString();
+    }
+
+    // Manual mode deliberately stores a blank timer.
+    if(resumeMode==='manual'){
+      untilIso='';
+    }
+
+    const rows=[
+      ['maintenance_message',message],
+      ['maintenance_eta',eta],
+      ['maintenance_until',untilIso]
+    ];
+
+    for(const [key,value] of rows){
+      await pool.query(`INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by)
+        VALUES($1,$2,NOW(),$3)
+        ON CONFLICT(setting_key) DO UPDATE SET
+          setting_value=EXCLUDED.setting_value,updated_at=NOW(),updated_by=EXCLUDED.updated_by`,
+        [key,value,ADMIN_EMAIL||'admin']);
+    }
+
+    maintenanceCache.at=0;
+
+    await auditAdmin(
+      req,'maintenance_details','site','global',
+      `message=${message?'set':'blank'};eta=${eta?'set':'blank'};resume_mode=${resumeMode};auto_resume=${untilIso||'manual'}`
+    );
+
+    let ok='Maintenance settings saved.';
+    if(resumeMode==='duration') ok+=' Auto resume will use the selected time-left duration.';
+    else if(resumeMode==='exact') ok+=' Auto resume will use the exact selected date/time.';
+    else ok+=' Maintenance will require manual OFF.';
+
+    res.redirect('/admin?success='+encodeURIComponent(ok));
+  }catch(e){
+    console.error('Maintenance details save error:',e);
+    res.redirect('/admin?error='+encodeURIComponent('Could not save maintenance details'));
+  }
+});
+
+app.post('/admin/site-maintenance/toggle',adminMiddleware,async(req,res)=>{
+  try{
+    const current=await isSiteMaintenanceOn(true),next=!current;
+    await pool.query(`INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by) VALUES('maintenance_mode',$1,NOW(),$2) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW(),updated_by=EXCLUDED.updated_by`,[next?'on':'off',ADMIN_EMAIL||'admin']);
+
+    if(!next){
+      await pool.query(`INSERT INTO site_settings(setting_key,setting_value,updated_at,updated_by)
+        VALUES('maintenance_until','',NOW(),$1)
+        ON CONFLICT(setting_key) DO UPDATE SET
+          setting_value='',updated_at=NOW(),updated_by=EXCLUDED.updated_by`,
+        [ADMIN_EMAIL||'admin']);
+    }
+
+    maintenanceCache={value:next,at:Date.now()};
+    await auditAdmin(req,'site_maintenance','site','global',`maintenance=${next?'on':'off'}`);
+    res.redirect('/admin?success='+encodeURIComponent(next?'Website maintenance mode is ON. All public services and short links are paused.':'Website maintenance mode is OFF. Website and short links are live again.'));
+  }catch(e){console.error('Maintenance toggle error:',e);res.redirect('/admin?error='+encodeURIComponent('Could not change maintenance mode'));}
+});
+
+
+app.post('/admin/tool-maintenance/:tool/toggle',adminMiddleware,async(req,res)=>{
+  try{
+    const tool=String(req.params.tool||'').toLowerCase();
+    if(!['x','canva'].includes(tool)) return res.redirect('/admin?error='+encodeURIComponent('Invalid tool'));
+    const key=tool==='x'?'x_tool_maintenance':'canva_tool_maintenance';
+    const current=await isToolMaintenanceOn(tool),next=!current;
+    await setX(key,next?'on':'off',ADMIN_EMAIL||'admin');
+    await auditAdmin(req,'tool_maintenance',tool,'global',`maintenance=${next?'on':'off'}`);
+    res.redirect('/admin?success='+encodeURIComponent(`${tool==='x'?'X Shortlink':'Canva Shortlink'} maintenance ${next?'ON':'OFF'}.`));
+  }catch(e){console.error('Tool maintenance toggle error:',e);res.redirect('/admin?error='+encodeURIComponent('Could not update tool maintenance'));}
+});
+
+app.get('/admin', adminMiddleware, async (req,res)=>{
+  try {
+    const [usersR,linksR,payR,active,totalClicksR,botClicksR,auditR,domainsR,backupsR,announcementsR,topCountriesR,topUserCountriesR,userRealStatsR,redeemCodesR,maintenanceR,redeemUsersR,maintenanceDetailsR,toolMaintenanceR] = await Promise.all([
+      pool.query('SELECT * FROM users ORDER BY created_at DESC LIMIT 500'),
+      pool.query(`SELECT l.*,u.display_name,u.username FROM links l JOIN users u ON u.id=l.user_id ORDER BY l.created_at DESC LIMIT 500`),
+      pool.query(`SELECT p.*,u.display_name,u.username,u.email FROM payments p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC LIMIT 300`),
+      getActiveOnlineUsers(),
+      pool.query('SELECT COUNT(*)::bigint AS count FROM clicks WHERE is_bot=FALSE'),
+      pool.query('SELECT COUNT(*)::bigint AS count FROM clicks WHERE is_bot=TRUE'),
+      pool.query('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 100'),
+      pool.query('SELECT * FROM domain_settings ORDER BY domain=$1 DESC,domain ASC',[normalizeHost(BASE_HOST)]),
+      pool.query('SELECT id,created_at,created_by FROM app_backups ORDER BY created_at DESC LIMIT 20'),
+      pool.query('SELECT * FROM announcements ORDER BY updated_at DESC,id DESC LIMIT 20'),
+      pool.query(`SELECT country_code,MAX(country) AS country,COUNT(*)::bigint AS count
+                  FROM clicks WHERE is_bot=FALSE
+                  GROUP BY country_code ORDER BY count DESC LIMIT 10`),
+      pool.query(`SELECT c.user_id,u.display_name,u.username,c.country_code,MAX(c.country) AS country,COUNT(*)::bigint AS count
+                  FROM clicks c JOIN users u ON u.id=c.user_id
+                  WHERE c.is_bot=FALSE
+                  GROUP BY c.user_id,u.display_name,u.username,c.country_code
+                  ORDER BY count DESC LIMIT 10`),
+      pool.query(`SELECT u.id,
+                    COUNT(c.id) FILTER (WHERE c.is_bot=FALSE)::bigint AS real_clicks,
+                    COUNT(c.id) FILTER (WHERE c.is_bot=TRUE)::bigint AS bot_clicks,
+                    COUNT(DISTINCT c.ip_address) FILTER (WHERE c.is_bot=FALSE AND c.ip_address<>'')::bigint AS unique_visitors
+                  FROM users u LEFT JOIN clicks c ON c.user_id=u.id
+                  GROUP BY u.id`),
+      pool.query(`SELECT r.*,COUNT(u.id)::int AS used_count FROM redeem_codes r LEFT JOIN redeem_code_uses u ON u.redeem_code_id=r.id GROUP BY r.id ORDER BY r.created_at DESC LIMIT 200`),
+      pool.query("SELECT setting_value,updated_at,updated_by FROM site_settings WHERE setting_key='maintenance_mode' LIMIT 1"),
+      pool.query(`SELECT ru.redeemed_at,rc.code,rc.premium_days,
+                         u.id AS user_id,u.telegram_id,u.username,u.first_name,u.last_name,u.display_name,u.email,u.timezone,
+                         u.account_status,u.created_at AS user_created_at,u.last_login,u.total_links,u.total_clicks,
+                         u.lifetime_links_created,u.plan_type,u.premium_until
+                  FROM redeem_code_uses ru
+                  JOIN redeem_codes rc ON rc.id=ru.redeem_code_id
+                  JOIN users u ON u.id=ru.user_id
+                  ORDER BY ru.redeemed_at DESC LIMIT 500`),
+      pool.query("SELECT setting_key,setting_value FROM site_settings WHERE setting_key IN ('maintenance_message','maintenance_eta','maintenance_until')"),
+      pool.query("SELECT setting_key,setting_value FROM site_settings WHERE setting_key IN ('x_tool_maintenance','canva_tool_maintenance')")
+    ]);
+    const userRealMap=new Map(userRealStatsR.rows.map(r=>[Number(r.id),{
+      realClicks:Number(r.real_clicks||0),botClicks:Number(r.bot_clicks||0),uniqueVisitors:Number(r.unique_visitors||0)
+    }]));
+    const users=usersR.rows.map(mapUser).map(u=>({...u,...(userRealMap.get(u.id)||{realClicks:0,botClicks:0,uniqueVisitors:0})}));
+    res.render('index',{page:'admin',user:req.session?.user?.id?await getUserById(req.session.user.id):null,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,
+      error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:BASE_URL,
+      adminUsers:users,adminLinks:linksR.rows,adminPayments:payR.rows,adminAudit:auditR.rows,adminDomains:domainsR.rows,adminBackups:backupsR.rows,adminAnnouncements:announcementsR.rows,adminTopCountries:topCountriesR.rows,adminTopUserCountries:topUserCountriesR.rows,
+      adminRedeemCodes:redeemCodesR.rows,adminRedeemUsers:redeemUsersR.rows,
+      siteMaintenanceOn:!!maintenanceR.rowCount && String(maintenanceR.rows[0].setting_value||'').toLowerCase()==='on',
+      siteMaintenanceUpdated:maintenanceR.rowCount?maintenanceR.rows[0]:null,
+      maintenanceMessage:(maintenanceDetailsR.rows.find(r=>r.setting_key==='maintenance_message')||{}).setting_value||'',
+      maintenanceEta:(maintenanceDetailsR.rows.find(r=>r.setting_key==='maintenance_eta')||{}).setting_value||'',
+      maintenanceUntil:(maintenanceDetailsR.rows.find(r=>r.setting_key==='maintenance_until')||{}).setting_value||'',
+      xToolMaintenance:String((toolMaintenanceR.rows.find(r=>r.setting_key==='x_tool_maintenance')||{}).setting_value||'off').toLowerCase()==='on',
+      canvaToolMaintenance:String((toolMaintenanceR.rows.find(r=>r.setting_key==='canva_tool_maintenance')||{}).setting_value||'off').toLowerCase()==='on',
+
+      adminStats:{totalUsers:users.length,online:active.length,totalLinks:linksR.rows.length,totalClicks:Number(totalClicksR.rows[0].count),botClicks:Number(botClicksR.rows[0].count),pendingPayments:payR.rows.filter(p=>p.status==='pending').length},
+      redirectPerf:getRedirectPerfStats(),
+      freeLinkLimit:FREE_LINK_LIMIT,plan1Price:PLAN_1_PRICE,plan3Price:PLAN_3_PRICE,plan12Price:PLAN_12_PRICE,plan1Usd:PLAN_1_USD,plan3Usd:PLAN_3_USD,plan12Usd:PLAN_12_USD,bkashNumber:BKASH_NUMBER,nagadNumber:NAGAD_NUMBER,binanceId:BINANCE_ID
+    });
+  }catch(e){console.error('Admin page error:',e);res.redirect('/admin/login?error='+encodeURIComponent('Admin page database error'));}
+});
+
+
+app.get('/admin/users/:id/stats', adminMiddleware, async(req,res)=>{
+  try{
+    const targetId=Number(req.params.id);
+    const targetUser=await getUserById(targetId);
+    if(!targetUser) return res.redirect('/admin?error='+encodeURIComponent('User not found'));
+
+    const [linksR,clicksR,topCountriesR,topLinksR]=await Promise.all([
+      pool.query('SELECT * FROM links WHERE user_id=$1 ORDER BY created_at DESC',[targetId]),
+      pool.query('SELECT * FROM clicks WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1000',[targetId]),
+      pool.query(`SELECT country_code,MAX(country) AS country,COUNT(*)::bigint AS count
+                  FROM clicks WHERE user_id=$1 AND is_bot=FALSE
+                  GROUP BY country_code ORDER BY count DESC LIMIT 10`,[targetId]),
+      pool.query(`SELECT l.id,l.short_code,l.selected_domain,l.original_url,l.link_type,
+                    COUNT(c.id) FILTER (WHERE c.is_bot=FALSE)::bigint AS real_clicks,
+                    COUNT(c.id) FILTER (WHERE c.is_bot=TRUE)::bigint AS bot_clicks
+                  FROM links l LEFT JOIN clicks c ON c.link_id=l.id
+                  WHERE l.user_id=$1
+                  GROUP BY l.id ORDER BY real_clicks DESC LIMIT 10`,[targetId])
+    ]);
+
+    const allClicks=clicksR.rows.map(mapClick);
+    const realClicks=allClicks.filter(c=>!c.isBot);
+    const botClicks=allClicks.filter(c=>c.isBot);
+    const uniqueVisitors=new Set(realClicks.map(c=>c.ipAddress).filter(Boolean)).size;
+
+    const today=new Date();today.setHours(0,0,0,0);
+    const chartDays=[];
+    for(let i=13;i>=0;i--){
+      const d=new Date(today);d.setDate(d.getDate()-i);
+      const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      chartDays.push({key,label:d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}),clicks:0});
+    }
+    const dayMap=new Map(chartDays.map((d,i)=>[d.key,i]));
+    for(const c of realClicks){
+      const d=new Date(c.createdAt);
+      const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      if(dayMap.has(key)) chartDays[dayMap.get(key)].clicks++;
+    }
+
+    const topLinks=topLinksR.rows.map(r=>{
+      const l=mapLink(r);
+      return {...l,realClicks:Number(r.real_clicks||0),botClicks:Number(r.bot_clicks||0),
+        shortUrl:l.linkType==='google_style'?buildGoogleStyleShortUrl(l):buildShortUrl(l)};
+    });
+    const active=await getActiveOnlineUsers();
+
+    res.render('index',{
+      page:'admin-user-stats',
+      user:req.session?.user?.id?await getUserById(req.session.user.id):null,
+      targetUser,
+      targetLinks:linksR.rows.map(mapLink),
+      targetRealClicks:realClicks.length,
+      targetBotClicks:botClicks.length,
+      targetUniqueVisitors:uniqueVisitors,
+      targetTopCountries:topCountriesR.rows,
+      targetTopLinks:topLinks,
+      targetRecentClicks:realClicks.slice(0,50),
+      targetChartDays:chartDays,
+      countries,
+      onlineUsers:active.length,
+      onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),
+      error:req.query.error||null,success:req.query.success||null,info:null,shortUrl:null,
+      customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,domainChoices:[],
+      baseDomain:BASE_HOST,baseUrl:BASE_URL
+    });
+  }catch(e){
+    console.error('Admin user stats error:',e);
+    res.redirect('/admin?error='+encodeURIComponent('Could not load user statistics'));
+  }
+});
+
+app.post('/admin/users/:id/block', adminMiddleware, async(req,res)=>{
+  try{
+    const id=Number(req.params.id),u=await getUserById(id); if(!u)return res.redirect('/admin?error='+encodeURIComponent('User not found'));
+    const next=u.accountStatus==='blocked'?'active':'blocked';
+    await pool.query('UPDATE users SET account_status=$1,blocked_reason=$2 WHERE id=$3',[next,next==='blocked'?String(req.body.reason||'Blocked by admin'):'',id]);
+    if(next==='blocked') await pool.query('DELETE FROM online_users WHERE user_id=$1',[id]);
+    await auditAdmin(req,'user_status','user',id,`status=${next}`);
+    await notifyUser(id,'Account status updated',`Your account is now ${next}.`,next==='blocked'?'warning':'success');
+    res.redirect('/admin?success='+encodeURIComponent(`User ${next}`));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update user'));}
+});
+
+app.post('/admin/users/:id/api-toggle', adminMiddleware, async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    const u=await getUserById(id);
+    if(!u)return res.redirect('/admin?error='+encodeURIComponent('User not found'));
+
+    const next=!u.apiAdminEnabled;
+    await pool.query('UPDATE users SET api_admin_enabled=$1 WHERE id=$2',[next,id]);
+
+    await auditAdmin(req,'api_admin_toggle','user',id,`api_admin_enabled=${next}`);
+    await notifyUser(
+      id,
+      'API administrator access updated',
+      next
+        ? 'Administrator enabled API access for your account. You can turn your own API ON from API Access settings.'
+        : 'Administrator disabled API access for your account. API requests will remain blocked until admin enables it again.',
+      next ? 'success' : 'warning'
+    );
+
+    res.redirect('/admin?success='+encodeURIComponent(next?'User API admin access enabled':'User API admin access disabled'));
+  }catch(e){
+    console.error('Admin API toggle error:',e);
+    res.redirect('/admin?error='+encodeURIComponent('Could not update user API access'));
+  }
+});
+
+app.post('/admin/users/:id/plan', adminMiddleware, async(req,res)=>{
+  try{
+    const id=Number(req.params.id),months=Number(req.body.months||0);
+    if(months===0) await pool.query("UPDATE users SET plan_type='free',premium_until=NULL WHERE id=$1",[id]);
+    else if([1,3,6,12].includes(months)) await pool.query("UPDATE users SET plan_type='premium',premium_until=GREATEST(COALESCE(premium_until,NOW()),NOW()) + ($1 || ' months')::interval WHERE id=$2",[months,id]);
+    else throw new Error('Invalid months');
+    await auditAdmin(req,'user_plan','user',id,`months=${months}`);
+    await notifyUser(id,'Plan updated',months===0?'Your account is now on the Free plan.':`Premium access was extended by ${months} month(s).`,'success');
+    res.redirect('/admin?success='+encodeURIComponent('User plan updated'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update plan'));}
+});
+app.post('/admin/links/:id/toggle', adminMiddleware, async(req,res)=>{
+  try{const id=Number(req.params.id);await pool.query('UPDATE links SET is_active=NOT is_active,updated_at=NOW() WHERE id=$1',[id]);await auditAdmin(req,'link_toggle','link',id,'');res.redirect('/admin?success='+encodeURIComponent('Link status updated'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update link'));}
+});
+app.post('/admin/links/:id/delete', adminMiddleware, async(req,res)=>{
+  try{const id=Number(req.params.id);await pool.query('DELETE FROM links WHERE id=$1',[id]);await auditAdmin(req,'link_delete','link',id,'');res.redirect('/admin?success='+encodeURIComponent('Link deleted'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not delete link'));}
+});
+app.get('/admin/payments/:id/screenshot', adminMiddleware, async(req,res)=>{
+  try{const q=await pool.query('SELECT screenshot,screenshot_mime FROM payments WHERE id=$1',[Number(req.params.id)]);if(!q.rowCount||!q.rows[0].screenshot)return res.status(404).send('No screenshot');res.type(q.rows[0].screenshot_mime||'image/jpeg').send(q.rows[0].screenshot);}catch(e){res.status(500).send('Screenshot error');}
+});
+app.post('/admin/payments/:id/approve', adminMiddleware, async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const q=await client.query("SELECT * FROM payments WHERE id=$1 FOR UPDATE",[Number(req.params.id)]);
+    if(!q.rowCount)throw new Error('Payment not found');
+    const p=q.rows[0];
+    if(p.status!=='approved'){
+      await client.query("UPDATE users SET plan_type='premium',premium_until=GREATEST(COALESCE(premium_until,NOW()),NOW()) + ($1 || ' months')::interval WHERE id=$2",[p.plan_months,p.user_id]);
+      await client.query("UPDATE payments SET status='approved',admin_note=$1,reviewed_at=NOW() WHERE id=$2",[String(req.body.note||''),p.id]);
+    }
+    await client.query('COMMIT'); await auditAdmin(req,'payment_approve','payment',p.id,`user=${p.user_id}; months=${p.plan_months}`); await notifyUser(p.user_id,'Payment approved',`Your ${p.plan_months}-month Premium plan is active.`,'success'); res.redirect('/admin?success='+encodeURIComponent('Payment approved and Premium activated'));
+  }catch(e){await client.query('ROLLBACK');res.redirect('/admin?error='+encodeURIComponent(e.message));}finally{client.release();}
+});
+app.post('/admin/payments/:id/reject', adminMiddleware, async(req,res)=>{
+  try{const id=Number(req.params.id);const q=await pool.query("UPDATE payments SET status='rejected',admin_note=$1,reviewed_at=NOW() WHERE id=$2 RETURNING user_id",[String(req.body.note||'Rejected by admin'),id]);await auditAdmin(req,'payment_reject','payment',id,'');if(q.rowCount)await notifyUser(q.rows[0].user_id,'Payment rejected','Your payment request was rejected. Check the admin note or contact support.','warning');res.redirect('/admin?success='+encodeURIComponent('Payment rejected'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not reject payment'));}
+});
+
+
+// ===== ADMIN ANNOUNCEMENTS =====
+app.post('/admin/announcement', adminMiddleware, async(req,res)=>{
+  try{
+    const message=String(req.body.message||'').trim();
+    if(!message)return res.redirect('/admin?error='+encodeURIComponent('Announcement message is required.'));
+    if(message.length>500)return res.redirect('/admin?error='+encodeURIComponent('Announcement is too long (max 500 characters).'));
+    await pool.query('UPDATE announcements SET is_active=FALSE,updated_at=NOW() WHERE is_active=TRUE');
+    const q=await pool.query('INSERT INTO announcements(message,is_active) VALUES($1,TRUE) RETURNING id',[message]);
+    await auditAdmin(req,'announcement_publish','announcement',q.rows[0].id,message);
+    res.redirect('/admin?success='+encodeURIComponent('Announcement published'));
+  }catch(e){console.error('Announcement publish error:',e);res.redirect('/admin?error='+encodeURIComponent('Could not publish announcement'));}
+});
+app.post('/admin/announcement/:id/toggle', adminMiddleware, async(req,res)=>{
+  try{
+    const id=Number(req.params.id),q=await pool.query('SELECT is_active FROM announcements WHERE id=$1',[id]);
+    if(!q.rowCount)return res.redirect('/admin?error='+encodeURIComponent('Announcement not found'));
+    const next=!q.rows[0].is_active;
+    if(next)await pool.query('UPDATE announcements SET is_active=FALSE,updated_at=NOW() WHERE is_active=TRUE');
+    await pool.query('UPDATE announcements SET is_active=$1,updated_at=NOW() WHERE id=$2',[next,id]);
+    await auditAdmin(req,'announcement_toggle','announcement',id,`active=${next}`);
+    res.redirect('/admin?success='+encodeURIComponent(next?'Announcement activated':'Announcement turned off'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update announcement'));}
+});
+app.post('/admin/announcement/:id/delete', adminMiddleware, async(req,res)=>{
+  try{const id=Number(req.params.id);await pool.query('DELETE FROM announcements WHERE id=$1',[id]);await auditAdmin(req,'announcement_delete','announcement',id,'');res.redirect('/admin?success='+encodeURIComponent('Announcement deleted'));}
+  catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not delete announcement'));}
+});
+
+app.post('/admin/users/:id/delete', adminMiddleware, async(req,res)=>{
+  try{
+    const id=Number(req.params.id);
+    await pool.query('DELETE FROM users WHERE id=$1',[id]);
+    await auditAdmin(req,'user_delete','user',id,'Cascade deleted user data');
+    res.redirect('/admin?success='+encodeURIComponent('User deleted'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not delete user'));}
+});
+app.post('/admin/domains/:domain/toggle', adminMiddleware, async(req,res)=>{
+  try{
+    const domain=normalizeHost(req.params.domain);
+    if(domain===normalizeHost(BASE_HOST)) return res.redirect('/admin?error='+encodeURIComponent('Base domain cannot be disabled.'));
+    const q=await pool.query('UPDATE domain_settings SET enabled=NOT enabled WHERE domain=$1 RETURNING enabled',[domain]);
+    await auditAdmin(req,'domain_toggle','domain',domain,q.rowCount?`enabled=${q.rows[0].enabled}`:'not found');
+    res.redirect('/admin?success='+encodeURIComponent('Domain status updated'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update domain'));}
+});
+app.post('/admin/domains/:domain/maintenance', adminMiddleware, async(req,res)=>{
+  try{
+    const domain=normalizeHost(req.params.domain);
+    const q=await pool.query('UPDATE domain_settings SET maintenance=NOT maintenance WHERE domain=$1 RETURNING maintenance',[domain]);
+    await auditAdmin(req,'domain_maintenance','domain',domain,q.rowCount?`maintenance=${q.rows[0].maintenance}`:'not found');
+    res.redirect('/admin?success='+encodeURIComponent('Domain maintenance status updated'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Could not update domain maintenance'));}
+});
+app.post('/admin/domains/check', adminMiddleware, async(req,res)=>{
+  try{
+    for(const domain of AVAILABLE_DOMAINS){
+      let status='down';
+      try{
+        const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),5000);
+        const r=await fetch(`${domainOrigin(domain)}/health`,{method:'GET',signal:controller.signal,redirect:'manual'});
+        clearTimeout(timer); status=r.ok?'healthy':`http-${r.status}`;
+      }catch(e){status='down';}
+      await pool.query('UPDATE domain_settings SET last_health=$1,last_checked_at=NOW() WHERE domain=$2',[status,normalizeHost(domain)]);
+    }
+    await auditAdmin(req,'domain_health_check','domain','','Checked all configured domains');
+    res.redirect('/admin?success='+encodeURIComponent('Domain health check completed'));
+  }catch(e){res.redirect('/admin?error='+encodeURIComponent('Domain health check failed'));}
+});
+app.post('/admin/backup/create', adminMiddleware, async(req,res)=>{
+  try{await createBackupSnapshot(ADMIN_EMAIL||'admin');await auditAdmin(req,'backup_create','backup','','Manual snapshot created');res.redirect('/admin?success='+encodeURIComponent('Database snapshot created'));}catch(e){res.redirect('/admin?error='+encodeURIComponent('Backup failed'));}
+});
+app.get('/admin/backup/:id/download', adminMiddleware, async(req,res)=>{
+  try{
+    const q=await pool.query('SELECT backup_data,created_at FROM app_backups WHERE id=$1',[Number(req.params.id)]);
+    if(!q.rowCount)return res.status(404).send('Backup not found');
+    res.setHeader('Content-Type','application/json; charset=utf-8');
+    res.setHeader('Content-Disposition',`attachment; filename="tpib-backup-${req.params.id}.json"`);
+    res.send(JSON.stringify(q.rows[0].backup_data,null,2));
+  }catch(e){res.status(500).send('Backup download failed');}
+});
+
+// ===== HEALTH =====
+app.get('/health',async(req,res)=>{
+  try{const db=await pool.query('SELECT NOW() AS now');res.json({status:'ok',database:'postgresql',dbTime:db.rows[0].now,domains:AVAILABLE_DOMAINS,baseUrl:BASE_URL,uptime:process.uptime()});}catch(e){res.status(500).json({status:'error',database:'down',error:e.message});}
+});
+
+// ===== PASSWORD-PROTECTED SHORT LINKS =====
+app.post('/unlock/:id', async(req,res)=>{
+  try{
+    const q=await pool.query('SELECT * FROM links WHERE id=$1',[Number(req.params.id)]);
+    if(!q.rowCount)return res.status(404).send('Link not found');
+    const row=q.rows[0],link=mapLink(row);
+    if(!row.password_enabled || !row.password_hash)return res.redirect(buildShortUrl(link));
+    if(!verifyLinkPassword(req.body.password,row.password_hash)){
+      return res.redirect(`${buildShortUrl(link)}?unlockError=1`);
+    }
+    if(!req.session.unlockedLinks)req.session.unlockedLinks={};
+    req.session.unlockedLinks[String(link.id)]=Date.now()+30*60*1000;
+    req.session.save(()=>res.redirect(buildShortUrl(link)));
+  }catch(e){res.status(500).send('Unlock failed');}
+});
+
+// ===== SHORT URL REDIRECT (keep after all named routes) =====
+async function processRedirectAnalytics(req,row,link){
+  try{
+    const ip=getRealClientIp(req);
+    const ua=req.headers['user-agent']||'';
+    const ref=req.headers['referer']||req.headers['referrer']||'';
+    const automated=isLikelyAutomatedRequest(req,ua);
+    const duplicate=!automated && isDuplicateRealClick(link.id,ip,ua);
+    const bot=automated || duplicate;
+    const di=getDeviceInfo(ua);
+    const geo=await resolveVisitorGeo(req,ip);
+
+    await pool.query(
+      `INSERT INTO clicks(link_id,user_id,ip_address,user_agent,device,browser,os,country,country_code,city,region,referrer,is_bot)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [link.id,link.userId,ip,ua,di.device,di.browser,di.os,geo.country,geo.countryCode,geo.city,geo.region,ref,bot]
+    );
+
+    if(!bot){
+      const clickUpdate=await pool.query(
+        `UPDATE links SET clicks=clicks+1,updated_at=NOW() WHERE id=$1 RETURNING *`,
+        [link.id]
+      );
+      pool.query('UPDATE users SET total_clicks=total_clicks+1 WHERE id=$1',[link.userId]).catch(()=>{});
+      const fresh=clickUpdate.rowCount?clickUpdate.rows[0]:row;
+
+      if(fresh.auto_update_enabled && fresh.auto_update_url && Number(fresh.auto_update_threshold)>0 &&
+         (Number(fresh.clicks)-Number(fresh.auto_update_start_clicks||0))>=Number(fresh.auto_update_threshold)){
+        const switched=await pool.query(
+          `UPDATE links
+           SET original_url=auto_update_url,
+               auto_update_enabled=FALSE,
+               auto_update_switched_at=NOW(),
+               updated_at=NOW()
+           WHERE id=$1 AND auto_update_enabled=TRUE
+           RETURNING original_url`,
+          [link.id]
+        );
+
+        if(switched.rowCount){
+          invalidateRedirectCache(link.selectedDomain||row.selected_domain,link.shortCode||row.short_code);
+          notifyUser(
+            link.userId,
+            'Automatic link update completed',
+            `Your short link ${buildShortUrl(link)} reached its click target and the destination was updated automatically.`,
+            'success'
+          ).catch(()=>{});
+        }
+      }
+    }
+  }catch(e){
+    console.error('Background redirect analytics error:',e.message||e);
+  }
+}
+
+async function handleStoredLinkRedirect(req,res,row){
+  try{
+    const link=mapLink(row);
+
+    if(link.isExpired||(link.expiresAt&&new Date(link.expiresAt)<new Date())){
+      pool.query('UPDATE links SET is_expired=TRUE WHERE id=$1',[link.id]).catch(()=>{});
+      return res.status(410).send('This link has expired');
+    }
+
+    const ua=req.headers['user-agent']||'';
+
+    if(row.password_enabled && row.password_hash && !isSocialPreviewBot(ua)){
+      const unlocked=req.session?.unlockedLinks?.[String(link.id)];
+      if(!unlocked || Number(unlocked)<Date.now()){
+        const active=await getActiveOnlineUsers();
+        const user=req.session?.user?.id?await getUserById(req.session.user.id):null;
+        return res.status(401).render('index',{
+          page:'link-password',user,link,unlockError:req.query.unlockError==='1',
+          onlineUsers:active.length,
+          onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),
+          countries,error:null,success:null,info:null,shortUrl:null,
+          customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,
+          baseDomain:BASE_HOST,baseUrl:getBaseUrl(req)
+        });
+      }
+    }
+
+    if(isSocialPreviewBot(ua)){
+      processRedirectAnalytics(req,row,link).catch(()=>{});
+      return renderSocialPreview(req,res,link);
+    }
+
+    // Visitor gets the 302 immediately. Click/geo analytics continue in background.
+    res.set('Cache-Control','no-store');
+    res.redirect(302,link.originalUrl);
+    processRedirectAnalytics(req,row,link).catch(()=>{});
+    return;
+  }catch(e){
+    console.error('Stored link redirect error:',e);
+    if(!res.headersSent) return res.status(500).send('Error redirecting');
+  }
+}
+
+// Google-style URL on YOUR OWN DOMAIN:
+// https://your-domain/share.google?q=CODE
+app.get('/share.google',async(req,res)=>{
+  try{
+    const code=String(req.query.q||'').trim();
+    if(!code) return res.status(400).send('Missing q parameter');
+
+    const requestHost=normalizeHost(req.get('host'));
+    const row=await findRedirectRow(requestHost,code);
+    if(!row) return res.status(404).send('Link not found or inactive');
+
+    return handleStoredLinkRedirect(req,res,row);
+  }catch(e){
+    console.error('Google-style redirect error:',e);
+    return res.status(500).send('Error redirecting');
+  }
+});
+
+app.get('/:code',async(req,res)=>{
+  try{
+    const code=req.params.code;
+    if(['favicon.ico','robots.txt','sitemap.xml'].includes(code)) return res.status(404).send('Not found');
+
+    const requestHost=normalizeHost(req.get('host'));
+    const row=await findRedirectRow(requestHost,code);
+    if(!row) return res.status(404).send('Link not found or inactive');
+
+    return handleStoredLinkRedirect(req,res,row);
+  }catch(e){
+    console.error('Redirect error:',e);
+    return res.status(500).send('Error redirecting');
+  }
+});
+
+// ===== 404 =====
+app.use(async(req,res)=>{
+  let user=null,active=[];try{if(req.session?.user?.id)user=await getUserById(req.session.user.id);active=await getActiveOnlineUsers();}catch(e){}
+  res.status(404).render('index',{page:'404',user,onlineUsers:active.length,onlineUserList:active.map(u=>({name:u.displayName||u.username||'User'})),countries,error:'Page not found',success:null,info:null,shortUrl:null,customDomains:CUSTOM_DOMAINS,availableDomains:AVAILABLE_DOMAINS,baseDomain:BASE_HOST,baseUrl:getBaseUrl(req)});
+});
+
+async function start(){
+  try{
+    await pool.query('SELECT 1');
+    console.log('✅ PostgreSQL connected');
+    await initDatabase();
+    await migrateLegacyJsonIfPossible();
+    await maybeCreateAutomaticBackup();
+    setInterval(()=>maybeCreateAutomaticBackup(), Math.min(AUTO_BACKUP_HOURS,6)*3600000).unref();
+    console.log('✅ Session store: PostgreSQL');
+    app.listen(PORT,'0.0.0.0',()=>{
+      console.log(`🚀 Server running on port ${PORT}`);console.log(`📡 Base URL: ${BASE_URL}`);console.log('🌐 Available Domains:');AVAILABLE_DOMAINS.forEach((d,i)=>console.log(`   ${i+1}. https://${d}`));console.log(`✅ Health check: ${BASE_URL}/health`);console.log(`🔐 Login page: ${BASE_URL}/login`);console.log(`📊 Dashboard: ${BASE_URL}/dashboard`);
+    });
+  }catch(e){console.error('❌ Database startup failed:',e);process.exit(1);}
+}
+start();
